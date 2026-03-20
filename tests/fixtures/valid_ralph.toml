@@ -1,0 +1,19 @@
+[ralph]
+branch_prefix = "ralph/test/"
+auto_push = true
+max_retries_per_task = 4
+max_ratchet_checks_per_task = 8
+
+[models]
+executor = "haiku"
+evaluator = "opus"
+cli = "claude"
+
+[timeouts]
+executor_call_seconds = 900
+verification_command_seconds = 180
+evaluator_call_seconds = 450
+
+[git]
+protected_branches = ["main", "release"]
+force_push = false

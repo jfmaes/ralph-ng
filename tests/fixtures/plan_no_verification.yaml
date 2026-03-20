@@ -1,0 +1,10 @@
+tasks:
+  - id: "TASK-001"
+    title: "Task without checks"
+    description: "Every task needs verification."
+    depends_on: []
+    acceptance_criteria:
+      - "Rejected"
+    verification_commands: []
+    expected_files:
+      - "project/src/existing_module.py"

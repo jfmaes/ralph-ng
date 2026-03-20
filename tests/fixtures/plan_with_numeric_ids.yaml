@@ -1,0 +1,11 @@
+tasks:
+  - id: 101
+    title: "Numeric ID should fail"
+    description: "IDs must remain strings."
+    depends_on: []
+    acceptance_criteria:
+      - "Rejected"
+    verification_commands:
+      - "pytest -q"
+    expected_files:
+      - "project/src/existing_module.py"

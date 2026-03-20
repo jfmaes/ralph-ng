@@ -1,0 +1,21 @@
+tasks:
+  - id: "TASK-001"
+    title: "Original task"
+    description: "First use of TASK-001."
+    depends_on: []
+    acceptance_criteria:
+      - "Rejected"
+    verification_commands:
+      - "pytest -q"
+    expected_files:
+      - "project/src/existing_module.py"
+  - id: "TASK-001"
+    title: "Duplicate task"
+    description: "Second use of TASK-001."
+    depends_on: []
+    acceptance_criteria:
+      - "Rejected"
+    verification_commands:
+      - "pytest -q"
+    expected_files:
+      - "project/src/another_module.py"

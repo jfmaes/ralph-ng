@@ -1,0 +1,35 @@
+tasks:
+  - id: "TASK-001"
+    title: "Append first marker"
+    description: "Append TASK-001 to work.txt."
+    depends_on: []
+    acceptance_criteria:
+      - "work.txt contains TASK-001."
+    verification_commands:
+      - "grep -q 'TASK-001' work.txt"
+    expected_files:
+      - "work.txt"
+
+  - id: "TASK-002"
+    title: "Append second marker"
+    description: "Append TASK-002 to work.txt."
+    depends_on:
+      - "TASK-001"
+    acceptance_criteria:
+      - "work.txt contains TASK-002."
+    verification_commands:
+      - "grep -q 'TASK-002' work.txt"
+    expected_files:
+      - "work.txt"
+
+  - id: "TASK-003"
+    title: "Append third marker"
+    description: "Append TASK-003 to work.txt."
+    depends_on:
+      - "TASK-002"
+    acceptance_criteria:
+      - "work.txt contains TASK-003."
+    verification_commands:
+      - "grep -q 'TASK-003' work.txt"
+    expected_files:
+      - "work.txt"

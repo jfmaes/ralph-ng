@@ -1,0 +1,14 @@
+defaults: &task_defaults
+  description: "Anchors are disallowed."
+  depends_on: []
+  acceptance_criteria:
+    - "This should never load."
+  verification_commands:
+    - "pytest -q"
+  expected_files:
+    - "project/src/existing_module.py"
+
+tasks:
+  - id: "TASK-001"
+    title: "Anchored task"
+    <<: *task_defaults

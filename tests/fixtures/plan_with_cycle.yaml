@@ -1,0 +1,23 @@
+tasks:
+  - id: "TASK-001"
+    title: "Cycle A"
+    description: "Depends on B."
+    depends_on:
+      - "TASK-002"
+    acceptance_criteria:
+      - "Rejected"
+    verification_commands:
+      - "pytest -q"
+    expected_files:
+      - "project/src/existing_module.py"
+  - id: "TASK-002"
+    title: "Cycle B"
+    description: "Depends on A."
+    depends_on:
+      - "TASK-001"
+    acceptance_criteria:
+      - "Rejected"
+    verification_commands:
+      - "pytest -q"
+    expected_files:
+      - "project/src/another_module.py"

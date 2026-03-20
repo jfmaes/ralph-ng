@@ -1,0 +1,7 @@
+[models]
+executor = ""
+evaluator = "opus"
+cli = "claude"
+
+[timeouts]
+executor_call_seconds = -5

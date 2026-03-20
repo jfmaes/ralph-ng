@@ -1,0 +1,22 @@
+tasks:
+  - id: "TASK-001"
+    title: "Update existing module"
+    description: "Modify the existing module in place."
+    depends_on: []
+    acceptance_criteria:
+      - "The existing module is updated."
+    verification_commands:
+      - "pytest tests/test_existing_module.py -x"
+    expected_files:
+      - "project/src/existing_module.py"
+  - id: "TASK-002"
+    title: "Refine another module"
+    description: "Make a follow-up change in another existing module."
+    depends_on:
+      - "TASK-001"
+    acceptance_criteria:
+      - "The second module is updated."
+    verification_commands:
+      - "pytest tests/test_another_module.py -x"
+    expected_files:
+      - "project/src/another_module.py"

@@ -1,0 +1,30 @@
+tasks:
+  - id: "TASK-001"
+    title: "Refine example module"
+    description: |
+      Update the existing example module implementation without changing the
+      public function name.
+    depends_on: []
+    acceptance_criteria:
+      - "project/src/example_module.py remains importable."
+      - "Behavior is covered by tests."
+    verification_commands:
+      - "pytest project/tests/test_example_module.py -x"
+    expected_files:
+      - "project/src/example_module.py"
+      - "project/tests/test_example_module.py"
+
+  - id: "TASK-002"
+    title: "Expand module tests"
+    description: |
+      Add a follow-up test pass that exercises edge cases introduced in the
+      previous task.
+    depends_on:
+      - "TASK-001"
+    acceptance_criteria:
+      - "Additional edge-case coverage exists in the test module."
+      - "The same verification command still passes."
+    verification_commands:
+      - "pytest project/tests/test_example_module.py -x"
+    expected_files:
+      - "project/tests/test_example_module.py"

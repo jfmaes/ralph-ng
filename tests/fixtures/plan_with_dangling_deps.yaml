@@ -1,0 +1,12 @@
+tasks:
+  - id: "TASK-001"
+    title: "Task with missing dependency"
+    description: "Depends on an unknown task."
+    depends_on:
+      - "TASK-999"
+    acceptance_criteria:
+      - "Rejected"
+    verification_commands:
+      - "pytest -q"
+    expected_files:
+      - "project/src/existing_module.py"

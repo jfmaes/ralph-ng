@@ -1,0 +1,10 @@
+tasks:
+  - id: "TASK-001"
+    description: "Missing title should fail."
+    depends_on: []
+    acceptance_criteria:
+      - "Rejected"
+    verification_commands:
+      - "pytest -q"
+    expected_files:
+      - "project/src/existing_module.py"

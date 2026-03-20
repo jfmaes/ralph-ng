@@ -1,0 +1,8 @@
+{
+  "decision": "reject",
+  "summary": "The implementation is missing regression coverage for the edge case described in the task.",
+  "repair_notes": "Add a regression test for the failing edge case and keep the existing behavior unchanged.",
+  "new_verification_commands": [
+    "pytest tests/test_regression.py -x"
+  ]
+}

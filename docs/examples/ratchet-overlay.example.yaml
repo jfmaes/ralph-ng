@@ -1,0 +1,3 @@
+task_id: "TASK-001"
+verification_commands:
+  - "pytest tests/test_regression.py -x"

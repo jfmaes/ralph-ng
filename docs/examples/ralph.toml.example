@@ -1,0 +1,19 @@
+[ralph]
+branch_prefix = "ralph/"
+auto_push = false
+max_retries_per_task = 3
+max_ratchet_checks_per_task = 10
+
+[models]
+executor = "sonnet"
+evaluator = "opus"
+cli = "claude"
+
+[timeouts]
+executor_call_seconds = 600
+verification_command_seconds = 120
+evaluator_call_seconds = 300
+
+[git]
+protected_branches = ["main", "master"]
+force_push = false

@@ -1,0 +1,11 @@
+tasks:
+  - id: "TASK-001"
+    title: "Task with impossible file reference"
+    description: "References a file that is neither present nor produced upstream."
+    depends_on: []
+    acceptance_criteria:
+      - "Rejected"
+    verification_commands:
+      - "pytest -q"
+    expected_files:
+      - "project/src/does_not_exist.py"
