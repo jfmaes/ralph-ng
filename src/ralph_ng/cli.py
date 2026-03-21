@@ -380,6 +380,12 @@ def validate_plan_command(
 def start_command(
     plan: Path = typer.Option(Path("ralph-plan.yaml"), "--plan", "-p"),
     config: Path = typer.Option(Path("ralph.toml"), "--config", "-c"),
+    number_of_tasks: int | None = typer.Option(
+        None,
+        "--number-of-tasks",
+        min=1,
+        help="Stop cleanly after this many tasks reach done during this invocation.",
+    ),
 ) -> None:
     """Start a new run."""
 
@@ -416,72 +422,73 @@ def start_command(
             lock_fd.close()
             raise ValueError("Another ralph process is starting. Wait for it to finish or remove the lock.")
         try:
-          with StateStore(state_root / "state.db") as store:
-            resumable_run = store.get_latest_resumable_run()
-            if resumable_run is not None:
-                # Check if the controller is actually alive
-                if store.is_controller_alive(resumable_run.id):
-                    raise ValueError(
-                        "A previous run is actively controlled. "
-                        f"Use `ralph watch --run-id {resumable_run.id}` to observe it."
-                    )
-                if resumable_run.status == "running":
-                    # Stale controller — mark as paused so new run can start
-                    store.update_run_status(resumable_run.id, "paused")
-                    store.release_controller(resumable_run.id, stop_reason='{"cause": "stale", "detail": "Superseded by new run"}')
-                    console.print(f"[yellow]Marked stale run {resumable_run.id} as paused.[/yellow]")
-                else:
-                    raise ValueError(
-                        "A previous run is still resumable. "
-                        f"Use `ralph resume --run-id {resumable_run.id}` instead of starting a new run."
-                    )
-            events = EventLogger(state_root / "events.jsonl")
-            pe_store = ProviderEventStore(state_root)
-            executor_tracker = LiveActivityTracker()
-            reviewer_tracker = LiveActivityTracker()
-            orchestrator = build_orchestrator(
-                repo_root=repo_root,
-                plan=validated_plan,
-                plan_path=plan_path,
-                config=loaded_config,
-                state_root=state_root,
-                store=store,
-                events=events,
-                executor_activity_tracker=executor_tracker,
-                reviewer_activity_tracker=reviewer_tracker,
-            )
-            run_id = generate_run_id()
-            global _active_run_id
-            _active_run_id = run_id
-            prev_handlers = _install_signal_handlers(orchestrator)
-            try:
-                outcome = run_with_progress(
-                    lambda: orchestrator.start(run_id=run_id),
-                    run_id=run_id,
+            with StateStore(state_root / "state.db") as store:
+                resumable_run = store.get_latest_resumable_run()
+                if resumable_run is not None:
+                    # Check if the controller is actually alive
+                    if store.is_controller_alive(resumable_run.id):
+                        raise ValueError(
+                            "A previous run is actively controlled. "
+                            f"Use `ralph watch --run-id {resumable_run.id}` to observe it."
+                        )
+                    if resumable_run.status == "running":
+                        # Stale controller — mark as paused so new run can start
+                        store.update_run_status(resumable_run.id, "paused")
+                        store.release_controller(resumable_run.id, stop_reason='{"cause": "stale", "detail": "Superseded by new run"}')
+                        console.print(f"[yellow]Marked stale run {resumable_run.id} as paused.[/yellow]")
+                    else:
+                        raise ValueError(
+                            "A previous run is still resumable. "
+                            f"Use `ralph resume --run-id {resumable_run.id}` instead of starting a new run."
+                        )
+                events = EventLogger(state_root / "events.jsonl")
+                pe_store = ProviderEventStore(state_root)
+                executor_tracker = LiveActivityTracker()
+                reviewer_tracker = LiveActivityTracker()
+                orchestrator = build_orchestrator(
+                    repo_root=repo_root,
                     plan=validated_plan,
+                    plan_path=plan_path,
                     config=loaded_config,
+                    state_root=state_root,
                     store=store,
                     events=events,
-                    provider_event_store=pe_store,
                     executor_activity_tracker=executor_tracker,
                     reviewer_activity_tracker=reviewer_tracker,
-                    orchestrator=orchestrator,
-                    state_root=str(state_root),
                 )
-            finally:
-                _restore_signal_handlers(prev_handlers)
-            if outcome is None:
-                raise typer.Exit(code=1)
-            console.print(f"Run {outcome.run_id}: {outcome.status}")
-            if outcome.status == RunStatus.PAUSED:
-                console.print(f"Run paused. Resume with: ralph resume --run-id {outcome.run_id}")
-            elif outcome.status in {"blocked_human", "blocked_system", "failed_exhausted"}:
-                _print_operator_guidance(
-                    run_id=outcome.run_id,
-                    store=store,
-                    events=events,
-                    provider_event_store=pe_store,
-                )
+                run_id = generate_run_id()
+                global _active_run_id
+                _active_run_id = run_id
+                prev_handlers = _install_signal_handlers(orchestrator)
+                try:
+                    outcome = run_with_progress(
+                        lambda: orchestrator.start(run_id=run_id, task_limit=number_of_tasks),
+                        run_id=run_id,
+                        plan=validated_plan,
+                        config=loaded_config,
+                        store=store,
+                        events=events,
+                        provider_event_store=pe_store,
+                        executor_activity_tracker=executor_tracker,
+                        reviewer_activity_tracker=reviewer_tracker,
+                        orchestrator=orchestrator,
+                        state_root=str(state_root),
+                    )
+                finally:
+                    _restore_signal_handlers(prev_handlers)
+                if outcome is None:
+                    raise typer.Exit(code=1)
+                console.print(f"Run {outcome.run_id}: {outcome.status}")
+                if outcome.status == RunStatus.PAUSED:
+                    console.print(outcome.reason)
+                    console.print(f"Run paused. Resume with: ralph resume --run-id {outcome.run_id}")
+                elif outcome.status in {"blocked_human", "blocked_system", "failed_exhausted"}:
+                    _print_operator_guidance(
+                        run_id=outcome.run_id,
+                        store=store,
+                        events=events,
+                        provider_event_store=pe_store,
+                    )
         finally:
             lock_fd.close()
     except (OSError, ValueError, PlanValidationError, GitError, OrchestratorError) as exc:
@@ -493,6 +500,12 @@ def start_command(
 def resume_command(
     run_id: str = typer.Option(..., "--run-id", help="Existing run identifier."),
     config: Path = typer.Option(Path("ralph.toml"), "--config", "-c"),
+    number_of_tasks: int | None = typer.Option(
+        None,
+        "--number-of-tasks",
+        min=1,
+        help="Stop cleanly after this many tasks reach done during this invocation.",
+    ),
 ) -> None:
     """Resume a previous run."""
 
@@ -551,7 +564,7 @@ def resume_command(
             prev_handlers = _install_signal_handlers(orchestrator)
             try:
                 outcome = run_with_progress(
-                    lambda: orchestrator.resume(run_id=run_id),
+                    lambda: orchestrator.resume(run_id=run_id, task_limit=number_of_tasks),
                     run_id=run_id,
                     plan=plan,
                     config=loaded_config,
@@ -569,6 +582,7 @@ def resume_command(
                 raise typer.Exit(code=1)
             console.print(f"Run {outcome.run_id}: {outcome.status}")
             if outcome.status == RunStatus.PAUSED:
+                console.print(outcome.reason)
                 console.print(f"Run paused. Resume with: ralph resume --run-id {outcome.run_id}")
             elif outcome.status in {"blocked_human", "blocked_system", "failed_exhausted"}:
                 _print_operator_guidance(

@@ -217,8 +217,8 @@ On `ralph resume`:
 
 | Command | Purpose |
 |---------|---------|
-| `ralph start` | Start a new run |
-| `ralph resume --run-id <id>` | Resume/adopt a paused or stale run |
+| `ralph start` | Start a new run; `--number-of-tasks N` stops cleanly after `N` completed tasks |
+| `ralph resume --run-id <id>` | Resume/adopt a paused or stale run; `--number-of-tasks N` resumes for `N` more completed tasks |
 | `ralph watch --run-id <id>` | Observe a running instance |
 | `ralph status --run-id <id>` | Dashboard snapshot |
 | `ralph status --run-id <id> --json` | Machine-readable status |

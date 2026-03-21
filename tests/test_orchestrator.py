@@ -290,6 +290,53 @@ def test_happy_path_executes_three_task_plan_to_completion(tmp_path: Path) -> No
     assert any(event.event_type == "run.stopped" for event in events.read_events())
 
 
+def test_task_limit_pauses_and_resume_counts_new_completions_only(tmp_path: Path) -> None:
+    repo = init_repo(tmp_path)
+    plan = make_plan(4)
+    executor = FakeExecutor(
+        repo,
+        {
+            "TASK-001": [executor_write_marker("TASK-001")],
+            "TASK-002": [executor_write_marker("TASK-002")],
+            "TASK-003": [executor_write_marker("TASK-003")],
+            "TASK-004": [executor_write_marker("TASK-004")],
+        },
+    )
+    reviewer = FakeReviewer(
+        {
+            "TASK-001": [accept_verdict()],
+            "TASK-002": [accept_verdict()],
+            "TASK-003": [accept_verdict()],
+            "TASK-004": [accept_verdict()],
+        }
+    )
+    _, store, _, orchestrator = make_orchestrator(tmp_path, plan, executor, reviewer)
+
+    first = orchestrator.start(run_id="run-001", task_limit=2)
+
+    assert first.status is RunStatus.PAUSED
+    assert first.reason == "Task limit reached after completing 2 task(s)."
+    assert store.get_run("run-001").status == "paused"
+    assert store.get_task_state("run-001", "TASK-001").state == "done"
+    assert store.get_task_state("run-001", "TASK-002").state == "done"
+    assert store.get_task_state("run-001", "TASK-003").state == "pending"
+    assert store.get_task_state("run-001", "TASK-004").state == "pending"
+
+    second = orchestrator.resume(run_id="run-001", task_limit=1)
+
+    assert second.status is RunStatus.PAUSED
+    assert second.reason == "Task limit reached after completing 1 task(s)."
+    assert store.get_run("run-001").status == "paused"
+    assert store.get_task_state("run-001", "TASK-003").state == "done"
+    assert store.get_task_state("run-001", "TASK-004").state == "pending"
+
+    final = orchestrator.resume(run_id="run-001", task_limit=1)
+
+    assert final.status is RunStatus.COMPLETED
+    assert store.get_run("run-001").status == "completed"
+    assert store.get_task_state("run-001", "TASK-004").state == "done"
+
+
 def test_retry_flow_rejects_once_then_accepts(tmp_path: Path) -> None:
     repo = init_repo(tmp_path)
     plan = make_plan(1)

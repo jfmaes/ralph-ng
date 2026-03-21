@@ -185,7 +185,7 @@ class Orchestrator:
             if transport is not None and hasattr(transport, "cancel_event"):
                 transport.cancel_event = self._shutdown_requested
 
-    def start(self, *, run_id: str) -> RunOutcome:
+    def start(self, *, run_id: str, task_limit: int | None = None) -> RunOutcome:
         import os as _os
         if not self.git_manager.is_clean():
             raise OrchestratorError("Cannot start with a dirty working tree.")
@@ -216,7 +216,7 @@ class Orchestrator:
                     "plan_path": self._stored_plan_path(),
                 },
             )
-            return self._run_loop(run_id)
+            return self._run_loop(run_id, task_limit=task_limit)
         finally:
             self._stop_heartbeat()
             stop_reason = None
@@ -224,7 +224,7 @@ class Orchestrator:
                 stop_reason = json.dumps({"cause": "operator_interrupt"})
             self.store.release_controller(run_id, stop_reason=stop_reason)
 
-    def resume(self, *, run_id: str) -> RunOutcome:
+    def resume(self, *, run_id: str, task_limit: int | None = None) -> RunOutcome:
         import os as _os
         if self.store.get_run(run_id) is None:
             raise OrchestratorError(f"Unknown run {run_id}.")
@@ -235,7 +235,7 @@ class Orchestrator:
         self.store.update_phase_checkpoint(run_id, "run:resumed")
         self.events.log("run.resumed", data={"run_id": run_id})
         try:
-            return self._run_loop(run_id)
+            return self._run_loop(run_id, task_limit=task_limit)
         finally:
             self._stop_heartbeat()
             stop_reason = None
@@ -292,15 +292,14 @@ class Orchestrator:
                     pass
         if not self._shutdown_requested.is_set():
             return None
-        stop_reason = json.dumps({"cause": "operator_interrupt", "detail": "Shutdown requested"})
         self.store.update_run_status(run_id, RunStatus.PAUSED)
         self.events.log(
             "run.stopped",
             data={"run_id": run_id, "status": RunStatus.PAUSED, "reason": "Operator requested pause"},
         )
-        return RunOutcome(run_id=run_id, status=RunStatus.PAUSED, reason=stop_reason)
+        return RunOutcome(run_id=run_id, status=RunStatus.PAUSED, reason="Operator requested pause")
 
-    def _run_loop(self, run_id: str) -> RunOutcome:
+    def _run_loop(self, run_id: str, *, task_limit: int | None = None) -> RunOutcome:
         scheduler = Scheduler(self.plan, self.store, run_id)
         ratchet_manager = RatchetManager(
             overlay_dir=self._ensure_run_paths(run_id).overlays_dir,
@@ -308,6 +307,7 @@ class Orchestrator:
             max_checks_per_task=self.config.ralph.max_ratchet_checks_per_task,
             validation_timeout_seconds=self.config.timeouts.verification_command_seconds,
         )
+        completed_task_ids: set[str] = set()
 
         while True:
             # Check for shutdown/pause request at the top of each loop iteration
@@ -388,6 +388,16 @@ class Orchestrator:
                 review_outcome = self._review_task(run_id, task, ratchet_manager)
                 if review_outcome is not None:
                     return review_outcome
+
+            limit_outcome = self._maybe_stop_after_task_limit(
+                run_id=run_id,
+                task_id=task.id,
+                scheduler=scheduler,
+                completed_task_ids=completed_task_ids,
+                task_limit=task_limit,
+            )
+            if limit_outcome is not None:
+                return limit_outcome
 
     def _execute_task(
         self,
@@ -1428,6 +1438,44 @@ class Orchestrator:
         if task is None:
             return None, None
         return task, self.fsm.get_state(run_id, task.id)
+
+    def _maybe_stop_after_task_limit(
+        self,
+        *,
+        run_id: str,
+        task_id: str,
+        scheduler: Scheduler,
+        completed_task_ids: set[str],
+        task_limit: int | None,
+    ) -> RunOutcome | None:
+        if task_limit is None or task_id in completed_task_ids:
+            return None
+        if self.fsm.get_state(run_id, task_id) is not TaskState.DONE:
+            return None
+
+        completed_task_ids.add(task_id)
+        if len(completed_task_ids) < task_limit:
+            return None
+        if scheduler.is_plan_complete():
+            self.store.update_run_status(run_id, RunStatus.COMPLETED)
+            self.events.log(
+                "run.stopped",
+                data={"run_id": run_id, "status": RunStatus.COMPLETED, "reason": "Plan complete"},
+            )
+            return RunOutcome(run_id=run_id, status=RunStatus.COMPLETED, reason="Plan complete")
+
+        reason = f"Task limit reached after completing {len(completed_task_ids)} task(s)."
+        self.store.update_run_status(run_id, RunStatus.PAUSED)
+        self.events.log(
+            "run.stopped",
+            data={
+                "run_id": run_id,
+                "status": RunStatus.PAUSED,
+                "reason": reason,
+                "task_limit": task_limit,
+            },
+        )
+        return RunOutcome(run_id=run_id, status=RunStatus.PAUSED, reason=reason)
 
     def _resolve_terminal_status(self, run_id: str) -> RunStatus:
         task_states = self.store.list_task_states(run_id)

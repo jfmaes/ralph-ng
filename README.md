@@ -24,10 +24,12 @@ Inside a git repository with `ralph-plan.yaml` and `ralph.toml`:
 
 ```bash
 ralph start                          # start a new run
+ralph start --number-of-tasks 4      # stop cleanly after 4 completed tasks
 ralph status --run-id <id>           # dashboard snapshot
 ralph status --run-id <id> --json    # machine-readable status
 ralph watch --run-id <id>            # attach to a running instance
 ralph resume --run-id <id>           # resume after interruption
+ralph resume --run-id <id> --number-of-tasks 2  # resume for 2 more tasks
 ralph stop                           # pause the active run
 ralph preflight                      # check environment before starting
 ralph doctor --run-id <id>           # diagnose a run's health

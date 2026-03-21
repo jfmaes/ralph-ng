@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 import sys
 
@@ -66,23 +67,30 @@ def init_repo(path: Path) -> Path:
     return repo
 
 
-def write_plan(repo: Path, *, content: str | None = None) -> None:
-    plan_content = content or "\n".join(
-        [
-            "tasks:",
-            "  - id: \"TASK-001\"",
-            "    title: \"Update work file\"",
-            "    description: \"Append a marker.\"",
-            "    depends_on: []",
-            "    acceptance_criteria:",
-            "      - \"Marker exists.\"",
-            "    verification_commands:",
-            f"      - \"{sys.executable} -c \\\"from pathlib import Path; "
-            "text=Path('work.txt').read_text(); assert 'TASK-001' in text\\\"\"",
-            "    expected_files:",
-            "      - \"work.txt\"",
-        ]
-    )
+def write_plan(repo: Path, *, content: str | None = None, task_count: int = 1) -> None:
+    if content is None:
+        lines = ["tasks:"]
+        for index in range(1, task_count + 1):
+            task_id = f"TASK-{index:03d}"
+            dependency = "[]" if index == 1 else f'["TASK-{index - 1:03d}"]'
+            lines.extend(
+                [
+                    f"  - id: \"{task_id}\"",
+                    f"    title: \"Update work file {index}\"",
+                    f"    description: \"Append a marker for {task_id}.\"",
+                    f"    depends_on: {dependency}",
+                    "    acceptance_criteria:",
+                    f"      - \"{task_id} exists.\"",
+                    "    verification_commands:",
+                    f"      - \"{sys.executable} -c \\\"from pathlib import Path; "
+                    f"text=Path('work.txt').read_text(); assert '{task_id}' in text\\\"\"",
+                    "    expected_files:",
+                    "      - \"work.txt\"",
+                ]
+            )
+        plan_content = "\n".join(lines)
+    else:
+        plan_content = content
     (repo / "ralph-plan.yaml").write_text(plan_content, encoding="utf-8")
     git(repo, "add", "ralph-plan.yaml")
     git(repo, "commit", "-m", "Add plan")
@@ -104,8 +112,10 @@ class FakeExecutor:
                 exit_status=1,
                 error_message="Rate limit exceeded",
             )
+        match = re.search(r"TASK-\d+", prompt)
+        task_id = match.group(0) if match else "TASK-001"
         with (self.repo_root / "work.txt").open("a", encoding="utf-8") as handle:
-            handle.write("TASK-001\n")
+            handle.write(f"{task_id}\n")
         return ExecutorResult(
             status=InvocationStatus.COMPLETED,
             output_text="ok",
@@ -204,6 +214,36 @@ def test_resume_loads_existing_run(tmp_path: Path, monkeypatch) -> None:
 
     assert result.exit_code == 0
     assert "completed" in result.stdout
+
+
+def test_start_and_resume_respect_number_of_tasks(tmp_path: Path, monkeypatch) -> None:
+    repo = init_repo(tmp_path)
+    write_plan(repo, task_count=3)
+    monkeypatch.chdir(repo)
+    monkeypatch.setattr("ralph_ng.cli.generate_run_id", lambda: "run-001")
+    monkeypatch.setattr("ralph_ng.cli.build_executor", lambda config, **kw: FakeExecutor(repo))
+    monkeypatch.setattr("ralph_ng.cli.build_reviewer", lambda config, **kw: FakeReviewer())
+
+    first = runner.invoke(app, ["start", "--number-of-tasks", "2"])
+
+    assert first.exit_code == 0
+    assert "run-001" in first.stdout
+    assert "paused" in first.stdout
+    assert "Task limit reached after completing 2 task(s)." in first.stdout
+    assert "Run paused. Resume with: ralph resume --run-id run-001" in first.stdout
+
+    from ralph_ng.state import StateStore
+
+    with StateStore(repo / ".git" / "ralph" / "state.db") as store:
+        assert store.get_run("run-001").status == "paused"
+        assert store.get_task_state("run-001", "TASK-001").state == "done"
+        assert store.get_task_state("run-001", "TASK-002").state == "done"
+        assert store.get_task_state("run-001", "TASK-003").state == "pending"
+
+    second = runner.invoke(app, ["resume", "--run-id", "run-001", "--number-of-tasks", "1"])
+
+    assert second.exit_code == 0
+    assert "completed" in second.stdout
 
 
 def test_start_refuses_when_resumable_run_exists(tmp_path: Path, monkeypatch) -> None:
