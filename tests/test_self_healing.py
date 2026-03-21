@@ -13,6 +13,7 @@ from ralph_ng.self_healing import (
     attempt_self_healing,
     is_failure_eligible_for_diagnosis,
 )
+from ralph_ng.state import StateStore, utc_now
 
 
 # ---------------------------------------------------------------------------
@@ -99,6 +100,36 @@ def test_attempt_self_healing_ineligible_failure():
     assert outcome.attempted is False
     assert outcome.succeeded is False
     assert outcome.diagnosis is None
+
+
+def test_attempt_self_healing_respects_diagnosis_budget(tmp_path):
+    config = SelfHealingConfig(enabled=True, max_diagnosis_per_task=1)
+    store = StateStore(tmp_path / "state.db")
+    store.create_run("plan.yaml", run_id="run-1", task_ids=["T1"])
+    store.connection.execute(
+        """
+        INSERT INTO recovery_attempts
+        (run_id, task_id, attempt_number, failure_class, recovery_kind, status, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        ("run-1", "T1", 1, "provider_crash", "diagnosis", "failed", utc_now()),
+    )
+    store.connection.commit()
+
+    outcome = attempt_self_healing(
+        config=config,
+        task_id="T1",
+        task_title="Task",
+        task_description="Desc",
+        failure_class=FailureClass.PROVIDER_CRASH,
+        error_message="boom",
+        cwd=tmp_path,
+        store=store,
+        run_id="run-1",
+    )
+
+    assert outcome.attempted is False
+    assert "Diagnosis budget exhausted" in outcome.summary
 
 
 # ---------------------------------------------------------------------------

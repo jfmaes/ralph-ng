@@ -12,6 +12,8 @@ from .claude_executor import ClaudeExecutorAdapter
 from .cli_claude_transport import CliClaudeTransport
 from .cli_codex_transport import CliCodexTransport
 from .codex_reviewer import CodexReviewerAdapter
+from .structured_reviewer import StructuredReviewerAdapter
+from .transport_executor import TransportExecutorAdapter
 from .streaming import LiveActivityTracker
 from .transport import Transport
 
@@ -64,7 +66,7 @@ def build_executor(
     """
     if config.roles is not None:
         transport = _build_transport(config.roles.executor, tracker=tracker)
-        return ClaudeExecutorAdapter(transport=transport)
+        return TransportExecutorAdapter(transport=transport)
 
     # Legacy fallback: build from [models] section
     transport = CliClaudeTransport(
@@ -87,7 +89,7 @@ def build_reviewer(
     """
     if config.roles is not None:
         transport = _build_transport(config.roles.reviewer, tracker=tracker)
-        return CodexReviewerAdapter(transport=transport, tracker=tracker)
+        return StructuredReviewerAdapter(transport=transport, tracker=tracker)
 
     raise FactoryError(
         "Reviewer requires [roles.reviewer] config. "

@@ -18,6 +18,9 @@ class TestProviderEventType:
         expected = {
             "agent.started",
             "agent.commentary",
+            "agent.thought_started",
+            "agent.thought_delta",
+            "agent.thought_finished",
             "agent.stderr",
             "agent.progress",
             "agent.structured_output",

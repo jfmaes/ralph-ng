@@ -9,6 +9,8 @@ from ralph_ng.adapters.cli_codex_transport import CliCodexTransport
 from ralph_ng.adapters.claude_executor import ClaudeExecutorAdapter
 from ralph_ng.adapters.codex_reviewer import CodexReviewerAdapter
 from ralph_ng.adapters.factory import FactoryError, build_executor, build_reviewer
+from ralph_ng.adapters.structured_reviewer import StructuredReviewerAdapter
+from ralph_ng.adapters.transport_executor import TransportExecutorAdapter
 from ralph_ng.config import RalphConfig, RoleConfig, RolesConfig
 
 
@@ -38,9 +40,16 @@ class TestBuildExecutor:
     def test_from_roles_config(self) -> None:
         config = _config_with_roles()
         executor = build_executor(config)
-        assert isinstance(executor, ClaudeExecutorAdapter)
+        assert isinstance(executor, TransportExecutorAdapter)
         assert isinstance(executor.transport, CliClaudeTransport)
         assert executor.transport.model == "sonnet"
+
+    def test_supports_codex_as_executor(self) -> None:
+        config = _config_with_roles(executor_provider="codex", executor_model="gpt-5.3-codex")
+        executor = build_executor(config)
+        assert isinstance(executor, TransportExecutorAdapter)
+        assert isinstance(executor.transport, CliCodexTransport)
+        assert executor.transport.model == "gpt-5.3-codex"
 
     def test_legacy_fallback(self) -> None:
         config = RalphConfig()  # no roles section
@@ -54,11 +63,18 @@ class TestBuildReviewer:
     def test_from_roles_config(self) -> None:
         config = _config_with_roles(reviewer_reasoning_effort="high", reviewer_service_tier="fast")
         reviewer = build_reviewer(config)
-        assert isinstance(reviewer, CodexReviewerAdapter)
+        assert isinstance(reviewer, StructuredReviewerAdapter)
         assert isinstance(reviewer.transport, CliCodexTransport)
         assert reviewer.transport.model == "gpt-5.3-codex"
         assert reviewer.transport.reasoning_effort == "high"
         assert reviewer.transport.service_tier == "fast"
+
+    def test_supports_claude_as_reviewer(self) -> None:
+        config = _config_with_roles(reviewer_provider="claude", reviewer_model="sonnet")
+        reviewer = build_reviewer(config)
+        assert isinstance(reviewer, StructuredReviewerAdapter)
+        assert isinstance(reviewer.transport, CliClaudeTransport)
+        assert reviewer.transport.model == "sonnet"
 
     def test_requires_roles(self) -> None:
         config = RalphConfig()  # no roles

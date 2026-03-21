@@ -183,6 +183,28 @@ def test_problem_banner_on_stale_running_review(tmp_path: Path) -> None:
     store = StateStore(tmp_path / "state.db")
     store.create_run("ralph-plan.yaml", run_id="run-001", status="running", task_ids=["TASK-001"])
     store.transition_task("run-001", "TASK-001", "review", attempt_count=1)
+    store.acquire_controller("run-001", 999999)
+    store.connection.execute(
+        "UPDATE runs SET last_heartbeat_at = ?, updated_at = ? WHERE id = ?",
+        ("2000-01-01T00:00:00+00:00", "2000-01-01T00:00:00+00:00", "run-001"),
+    )
+    store.connection.commit()
+    renderer = ProgressRenderer(store=store, events=EventLogger(tmp_path / "events.jsonl"))
+
+    output = renderer.render_text("run-001", plan=make_plan())
+
+    assert "Run heartbeat stale" in output
+    assert "orchestrator process may have died" in output
+
+
+def test_problem_banner_uses_controller_heartbeat_not_updated_at(tmp_path: Path) -> None:
+    import os
+
+    store = StateStore(tmp_path / "state.db")
+    store.create_run("ralph-plan.yaml", run_id="run-001", status="running", task_ids=["TASK-001"])
+    store.transition_task("run-001", "TASK-001", "review", attempt_count=1)
+    store.acquire_controller("run-001", os.getpid())
+    store.update_heartbeat("run-001")
     store.connection.execute(
         "UPDATE runs SET updated_at = ? WHERE id = ?",
         ("2000-01-01T00:00:00+00:00", "run-001"),
@@ -192,8 +214,7 @@ def test_problem_banner_on_stale_running_review(tmp_path: Path) -> None:
 
     output = renderer.render_text("run-001", plan=make_plan())
 
-    assert "Run heartbeat stale" in output
-    assert "orchestrator process may have died" in output
+    assert "Run heartbeat stale" not in output
 
 
 def test_provider_activity_defaults(tmp_path: Path) -> None:
@@ -294,6 +315,54 @@ def test_activity_panel_falls_back_to_tool_activity(tmp_path: Path) -> None:
     assert "[Bash] npm test" in output
 
 
+def test_activity_panel_groups_thought_events(tmp_path: Path) -> None:
+    store = StateStore(tmp_path / "state.db")
+    store.create_run("ralph-plan.yaml", run_id="run-001", status="running", task_ids=["TASK-001"])
+    store.transition_task("run-001", "TASK-001", "review", attempt_count=1)
+    events = EventLogger(tmp_path / "events.jsonl")
+
+    from ralph_ng.providers.event_store import ProviderEventStore
+    from ralph_ng.providers.events import ProviderEventType, make_event
+
+    pe_store = ProviderEventStore(tmp_path)
+    pe_store.log(make_event(
+        run_id="run-001", task_id="TASK-001", attempt_number=1,
+        provider="codex", role="reviewer", review_round=1,
+        event_type=ProviderEventType.AGENT_STARTED,
+    ))
+    pe_store.log(make_event(
+        run_id="run-001", task_id="TASK-001", attempt_number=1,
+        provider="codex", role="reviewer", review_round=1,
+        event_type=ProviderEventType.AGENT_THOUGHT_STARTED,
+        payload={"text": "Inspecting spec coverage first", "block_id": "thought-1"},
+    ))
+    pe_store.log(make_event(
+        run_id="run-001", task_id="TASK-001", attempt_number=1,
+        provider="codex", role="reviewer", review_round=1,
+        event_type=ProviderEventType.AGENT_THOUGHT_DELTA,
+        payload={"text": "Inspecting spec coverage first and then checking edge cases", "block_id": "thought-1"},
+    ))
+    pe_store.log(make_event(
+        run_id="run-001", task_id="TASK-001", attempt_number=1,
+        provider="codex", role="reviewer", review_round=1,
+        event_type=ProviderEventType.AGENT_THOUGHT_FINISHED,
+        payload={"text": "Now checking edge cases around missing dependencies", "block_id": "thought-2"},
+    ))
+
+    renderer = ProgressRenderer(
+        store=store,
+        events=events,
+        provider_event_store=pe_store,
+    )
+
+    output = renderer.render_text("run-001", plan=make_plan())
+
+    assert "Thought 1:" in output
+    assert "Inspecting spec coverage first" in output
+    assert "checking edge cases" in output
+    assert "Thought 2:" in output
+
+
 def test_focus_panel_shows_verification_and_risk(tmp_path: Path) -> None:
     store = StateStore(tmp_path / "state.db")
     store.create_run("ralph-plan.yaml", run_id="run-001", status="running", task_ids=["TASK-001"])
@@ -317,3 +386,48 @@ def test_focus_panel_shows_verification_and_risk(tmp_path: Path) -> None:
     assert "verification 1/1 pass" in output
     assert "reviewer-scrutiny: low (diff based)" in output
     assert "12" in output and "2 files" in output
+
+
+def test_focus_panel_shows_latest_reviewer_findings(tmp_path: Path) -> None:
+    store = StateStore(tmp_path / "state.db")
+    store.create_run("ralph-plan.yaml", run_id="run-001", status="running", task_ids=["TASK-001"])
+    store.transition_task("run-001", "TASK-001", "repair", attempt_count=1)
+    attempt = store.record_attempt(
+        "run-001",
+        "TASK-001",
+        1,
+        review_path=str(tmp_path / "review.json"),
+    )
+    review_payload = {
+        "status": "completed",
+        "findings": {
+            "decision": "reject",
+            "confidence": 0.93,
+            "spec_compliance": "fail",
+            "summary": "Reviewer found real bugs",
+            "findings": [
+                {
+                    "id": "F1",
+                    "severity": "critical",
+                    "category": "correctness",
+                    "description": "Header callback never opens the modal.",
+                },
+                {
+                    "id": "F2",
+                    "severity": "important",
+                    "category": "testing",
+                    "description": "Clipboard errors are not handled.",
+                },
+            ],
+        },
+    }
+    Path(attempt.review_path or "").write_text(__import__("json").dumps(review_payload), encoding="utf-8")
+    renderer = ProgressRenderer(store=store, events=EventLogger(tmp_path / "events.jsonl"))
+
+    output = renderer.render_text("run-001", plan=make_plan())
+
+    assert "review verdict: reject (0.93)" in output
+    assert "F1 [critical] (correctness): Header" in output
+    assert "callback never opens the modal." in output
+    assert "F2 [important] (testing): Clipboard errors" in output
+    assert "are not handled." in output

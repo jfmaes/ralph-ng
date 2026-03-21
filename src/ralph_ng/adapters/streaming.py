@@ -47,14 +47,27 @@ class ActivityEvent:
     kind: ActivityKind
     summary: str
     significant: bool
+    text: str | None = None
+    block_id: str | None = None
+    block_state: str | None = None
 
 
-def make_activity(kind: ActivityKind, summary: str) -> ActivityEvent:
+def make_activity(
+    kind: ActivityKind,
+    summary: str,
+    *,
+    text: str | None = None,
+    block_id: str | None = None,
+    block_state: str | None = None,
+) -> ActivityEvent:
     """Create an ActivityEvent, auto-setting significance from kind."""
     return ActivityEvent(
         kind=kind,
         summary=summary,
         significant=kind in _SIGNIFICANT_KINDS,
+        text=summary if text is None else text,
+        block_id=block_id,
+        block_state=block_state,
     )
 
 
@@ -98,7 +111,8 @@ class LiveActivityTracker:
             if event.kind in (ActivityKind.COMMENTARY, ActivityKind.RESULT, ActivityKind.ERROR)
         ]
         if textual:
-            return textual[-n:]
+            collapsed = self._collapse_textual_blocks(textual)
+            return collapsed[-n:]
 
         progress = [event for event in events if event.kind == ActivityKind.PROGRESS]
         if progress:
@@ -113,6 +127,29 @@ class LiveActivityTracker:
     def set_sink(self, sink: Callable[[ActivityEvent], None] | None) -> None:
         with self._lock:
             self._sink = sink
+
+    @staticmethod
+    def _collapse_textual_blocks(events: list[ActivityEvent]) -> list[ActivityEvent]:
+        """Collapse streaming thought updates to the latest event per block.
+
+        This keeps the operator-facing display from showing multiple partial
+        snapshots for the same thought while still preserving all events in the
+        underlying tracker and provider event log.
+        """
+        collapsed: list[ActivityEvent] = []
+        index_by_block: dict[str, int] = {}
+
+        for event in events:
+            if event.block_id is None:
+                collapsed.append(event)
+                continue
+            existing_index = index_by_block.get(event.block_id)
+            if existing_index is None:
+                index_by_block[event.block_id] = len(collapsed)
+                collapsed.append(event)
+            else:
+                collapsed[existing_index] = event
+        return collapsed
 
 
 @dataclass(slots=True)

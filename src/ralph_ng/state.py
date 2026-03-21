@@ -59,6 +59,20 @@ class InvocationRecord:
     created_at: str
 
 
+@dataclass(slots=True)
+class RecoveryAttemptRecord:
+    id: int
+    run_id: str
+    task_id: str
+    attempt_number: int
+    failure_class: str
+    recovery_kind: str
+    status: str
+    summary: str | None
+    artifact_path: str | None
+    created_at: str
+
+
 class StateStore:
     """Persist runs, task states, attempts, and model invocations."""
 
@@ -503,12 +517,17 @@ class StateStore:
             """,
             (run_id,),
         ).fetchone()
+        recovery_attempts = self.connection.execute(
+            "SELECT COUNT(*) AS count FROM recovery_attempts WHERE run_id = ?",
+            (run_id,),
+        ).fetchone()
 
         return {
             "run": run,
             "task_states": {row["state"]: row["count"] for row in task_states},
             "attempt_count": attempts["count"],
             "invocations": dict(invocation_totals),
+            "recovery_attempt_count": recovery_attempts["count"],
         }
 
     def get_invocation_counts(self, run_id: str) -> dict[str, int]:
@@ -523,6 +542,32 @@ class StateStore:
             (run_id,),
         ).fetchall()
         return {row["role"]: row["count"] for row in rows}
+
+    def list_recovery_attempts(self, run_id: str, *, task_id: str | None = None) -> list[RecoveryAttemptRecord]:
+        """Return recovery attempts for a run, newest first."""
+        if task_id is None:
+            rows = self.connection.execute(
+                """
+                SELECT id, run_id, task_id, attempt_number, failure_class, recovery_kind,
+                       status, summary, artifact_path, created_at
+                FROM recovery_attempts
+                WHERE run_id = ?
+                ORDER BY created_at DESC, id DESC
+                """,
+                (run_id,),
+            ).fetchall()
+        else:
+            rows = self.connection.execute(
+                """
+                SELECT id, run_id, task_id, attempt_number, failure_class, recovery_kind,
+                       status, summary, artifact_path, created_at
+                FROM recovery_attempts
+                WHERE run_id = ? AND task_id = ?
+                ORDER BY created_at DESC, id DESC
+                """,
+                (run_id, task_id),
+            ).fetchall()
+        return [RecoveryAttemptRecord(**dict(row)) for row in rows]
 
     def acquire_controller(self, run_id: str, pid: int) -> None:
         """Record that this process is the active controller."""

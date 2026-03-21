@@ -83,6 +83,36 @@ class TestLiveActivityTracker:
         assert recent[0].summary == "Step 7"
         assert recent[2].summary == "Step 9"
 
+    def test_recent_display_collapses_updates_for_same_thought(self) -> None:
+        tracker = LiveActivityTracker()
+        tracker.push(make_activity(
+            ActivityKind.COMMENTARY,
+            "Checking auth flow",
+            text="Checking auth flow",
+            block_id="t1",
+            block_state="start",
+        ))
+        tracker.push(make_activity(
+            ActivityKind.COMMENTARY,
+            "Checking auth flow and expiry guard",
+            text="Checking auth flow and expiry guard",
+            block_id="t1",
+            block_state="update",
+        ))
+        tracker.push(make_activity(
+            ActivityKind.COMMENTARY,
+            "Now validating refresh token handling",
+            text="Now validating refresh token handling",
+            block_id="t2",
+            block_state="start",
+        ))
+
+        recent = tracker.recent_display(5)
+        assert len(recent) == 2
+        assert recent[0].block_id == "t1"
+        assert recent[0].text == "Checking auth flow and expiry guard"
+        assert recent[1].block_id == "t2"
+
     def test_clear(self) -> None:
         tracker = LiveActivityTracker()
         tracker.push(make_activity(ActivityKind.COMMENTARY, "thinking"))

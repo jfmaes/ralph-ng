@@ -45,6 +45,8 @@ class CliCodexTransport(Transport):
         self.cancel_event: __import__("threading").Event | None = None
         # Buffer for accumulating streaming text deltas into full thoughts
         self._text_buffer: list[str] = []
+        self._thought_counter = 0
+        self._current_thought_id: str | None = None
 
     def invoke(
         self,
@@ -129,7 +131,7 @@ class CliCodexTransport(Transport):
                     pass
         # Flush any remaining buffered text after stream ends
         if self.tracker is not None:
-            self._flush_text_buffer()
+            self._flush_text_buffer(final=True)
         duration = time.monotonic() - started_at
 
         if stream_result.timed_out:
@@ -199,21 +201,25 @@ class CliCodexTransport(Transport):
         """Check if the codex CLI is available on PATH."""
         return shutil.which(self.cli_path) is not None
 
+    def _start_thought(self) -> None:
+        self._thought_counter += 1
+        self._current_thought_id = f"codex-thought-{self._thought_counter}"
+
     def _extract_activity(self, event: dict[str, Any]) -> None:
         """Extract reasoning and tool activity from a Codex JSONL event."""
         assert self.tracker is not None
         event_type = event.get("type", "")
 
         if event_type == "thread.started":
-            self._flush_text_buffer()
+            self._flush_text_buffer(final=True)
             self.tracker.push(make_activity(ActivityKind.PROGRESS, "review session started"))
 
         elif event_type == "turn.started":
-            self._flush_text_buffer()
+            self._flush_text_buffer(final=True)
             self.tracker.push(make_activity(ActivityKind.PROGRESS, "review turn started"))
 
         elif event_type == "turn.completed":
-            self._flush_text_buffer()
+            self._flush_text_buffer(final=True)
             self.tracker.push(make_activity(ActivityKind.RESULT, "review turn completed"))
 
         elif event_type == "item.started":
@@ -230,7 +236,7 @@ class CliCodexTransport(Transport):
             elif item_type == "reasoning":
                 text = item.get("text", "") or item.get("summary", "")
                 if text:
-                    self._push_reasoning(text)
+                    self._push_reasoning(text, final=True, force_new=True)
                 else:
                     self.tracker.push(make_activity(ActivityKind.PROGRESS, "reasoning started"))
             elif item_type == "agent_message":
@@ -248,7 +254,11 @@ class CliCodexTransport(Transport):
                     f"[Edit] {file_path}",
                 ))
             elif item_type == "reasoning":
-                self._push_reasoning(item.get("text", "") or item.get("summary", ""))
+                self._push_reasoning(
+                    item.get("text", "") or item.get("summary", ""),
+                    final=True,
+                    force_new=True,
+                )
             elif item_type == "agent_message":
                 # Look for reasoning in content blocks only — skip
                 # structured JSON output (the final answer).
@@ -261,7 +271,7 @@ class CliCodexTransport(Transport):
                         if block.get("type") in ("output_text", "text"):
                             text = block.get("text", "")
                             if text and not self._looks_like_json(text):
-                                self._push_reasoning(text)
+                                self._push_reasoning(text, final=True, force_new=True)
                                 emitted_reasoning = True
                 if not emitted_reasoning:
                     self.tracker.push(make_activity(ActivityKind.RESULT, "structured review output received"))
@@ -280,7 +290,7 @@ class CliCodexTransport(Transport):
                         self._flush_text_buffer()
 
         elif event_type == "response.output_item.done":
-            self._flush_text_buffer()
+            self._flush_text_buffer(final=True)
             self.tracker.push(make_activity(ActivityKind.RESULT, "response item completed"))
 
         # Error events
@@ -304,7 +314,7 @@ class CliCodexTransport(Transport):
                     f"tokens {self._fmt_tokens(input_tokens or 0)} in / {self._fmt_tokens(output_tokens or 0)} out",
                 ))
 
-    def _flush_text_buffer(self) -> None:
+    def _flush_text_buffer(self, *, final: bool = False) -> None:
         """Flush accumulated streaming text as commentary events."""
         if not self._text_buffer or self.tracker is None:
             return
@@ -312,19 +322,47 @@ class CliCodexTransport(Transport):
         self._text_buffer = []
         if not full:
             return
-        self._push_reasoning(full)
+        self._push_reasoning(full, final=final)
 
-    def _push_reasoning(self, text: str) -> None:
-        """Push reasoning text as one or more commentary events."""
+    def _push_reasoning(
+        self,
+        text: str,
+        *,
+        final: bool = False,
+        force_new: bool = False,
+    ) -> None:
+        """Push reasoning text as a grouped thought block."""
         assert self.tracker is not None
         if not text or len(text.strip()) < 3:
             return
         stripped = text.strip()
-        lines = stripped.splitlines()
-        for line in lines:
+        if self._looks_like_json(stripped):
+            return
+        if force_new or self._current_thought_id is None:
+            self._start_thought()
+
+        summary = stripped
+        for line in reversed(stripped.splitlines()):
             line = line.strip()
             if line and not self._looks_like_json(line):
-                self.tracker.push(make_activity(ActivityKind.COMMENTARY, line))
+                summary = line
+                break
+
+        block_state = "update"
+        if force_new:
+            block_state = "start"
+        elif final:
+            block_state = "finish"
+
+        self.tracker.push(make_activity(
+            ActivityKind.COMMENTARY,
+            summary[:80],
+            text=stripped,
+            block_id=self._current_thought_id,
+            block_state=block_state,
+        ))
+        if final:
+            self._current_thought_id = None
 
     @staticmethod
     def _looks_like_json(text: str) -> bool:

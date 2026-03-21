@@ -239,6 +239,31 @@ def attempt_self_healing(
             summary=f"Failure class {failure_class} is not eligible for self-healing",
         )
 
+    if store is not None and run_id:
+        try:
+            row = store.connection.execute(
+                """
+                SELECT COUNT(*) AS cnt
+                FROM recovery_attempts
+                WHERE run_id = ? AND task_id = ? AND recovery_kind = 'diagnosis'
+                """,
+                (run_id, task_id),
+            ).fetchone()
+            previous_attempts = 0 if row is None else int(row["cnt"])
+        except Exception:
+            previous_attempts = 0
+        if previous_attempts >= config.max_diagnosis_per_task:
+            return RecoveryOutcome(
+                attempted=False,
+                succeeded=False,
+                diagnosis=None,
+                actions_taken=[],
+                summary=(
+                    f"Diagnosis budget exhausted for {task_id}: "
+                    f"{previous_attempts}/{config.max_diagnosis_per_task} attempts used"
+                ),
+            )
+
     if events:
         events.log("self_healing.diagnosis_started", task_id=task_id, data={
             "run_id": run_id, "failure_class": failure_class.value,

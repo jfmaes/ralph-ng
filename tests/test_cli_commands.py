@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -9,6 +10,7 @@ from typer.testing import CliRunner
 
 from ralph_ng.adapters.base import ExecutorResult, InvocationStatus
 from ralph_ng.cli import app
+from ralph_ng.preflight import PreflightCheck, PreflightResult
 from ralph_ng.review_findings import ReviewResult, ReviewFindings
 
 
@@ -162,6 +164,28 @@ def test_start_creates_run_and_begins_execution(tmp_path: Path, monkeypatch) -> 
     assert (repo / ".git" / "ralph" / "state.db").exists()
 
 
+def test_start_runs_preflight_and_continues_on_warning(tmp_path: Path, monkeypatch) -> None:
+    repo = init_repo(tmp_path)
+    write_plan(repo)
+    monkeypatch.chdir(repo)
+    monkeypatch.setattr("ralph_ng.cli.generate_run_id", lambda: "run-001")
+    monkeypatch.setattr("ralph_ng.cli.build_executor", lambda config, **kw: FakeExecutor(repo))
+    monkeypatch.setattr("ralph_ng.cli.build_reviewer", lambda config, **kw: FakeReviewer())
+    monkeypatch.setattr(
+        "ralph_ng.preflight.run_preflight",
+        lambda **kwargs: PreflightResult(checks=[
+            PreflightCheck(name="Executor CLI", passed=False, message="missing"),
+        ]),
+    )
+
+    result = runner.invoke(app, ["start"])
+
+    assert result.exit_code == 0
+    assert "Preflight Checks" in result.stdout
+    assert "Continuing despite preflight warnings" in result.stdout
+    assert "completed" in result.stdout
+
+
 def test_resume_loads_existing_run(tmp_path: Path, monkeypatch) -> None:
     repo = init_repo(tmp_path)
     write_plan(repo)
@@ -217,6 +241,133 @@ def test_status_displays_run_info(tmp_path: Path, monkeypatch) -> None:
     assert result.exit_code == 0
     assert "run-001" in result.stdout
     assert "COMPLETED" in result.stdout
+
+
+def test_status_json_displays_controller_and_failure_info(tmp_path: Path, monkeypatch) -> None:
+    repo = init_repo(tmp_path)
+    write_plan(repo)
+    monkeypatch.chdir(repo)
+
+    state_root = repo / ".git" / "ralph"
+    state_root.mkdir(parents=True, exist_ok=True)
+    from ralph_ng.state import StateStore
+
+    with StateStore(state_root / "state.db") as store:
+        store.create_run("ralph-plan.yaml", run_id="run-001", status="blocked_system", task_ids=["TASK-001"])
+        store.acquire_controller("run-001", os.getpid())
+        store.update_phase_checkpoint("run-001", "review:TASK-001:attempt:1")
+        store.transition_task("run-001", "TASK-001", "blocked_system", attempt_count=1, last_error="boom")
+        store.update_task_failure("run-001", "TASK-001", "provider_crash")
+        store.connection.execute(
+            """
+            INSERT INTO recovery_attempts
+            (run_id, task_id, attempt_number, failure_class, recovery_kind, status, summary, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            ("run-001", "TASK-001", 1, "provider_crash", "diagnosis", "failed", "diagnosis failed", "2026-03-21T00:00:00+00:00"),
+        )
+        store.connection.commit()
+
+    result = runner.invoke(app, ["status", "--run-id", "run-001", "--json"])
+
+    assert result.exit_code == 0
+    payload = json.loads(result.stdout)
+    assert payload["run_id"] == "run-001"
+    assert payload["status"] == "blocked_system"
+    assert payload["controller_alive"] is True
+    assert payload["phase_checkpoint"] == "review:TASK-001:attempt:1"
+    assert payload["current_task"] == "TASK-001"
+    assert payload["failure_class"] == "provider_crash"
+    assert payload["tasks"]["TASK-001"]["failure_class"] == "provider_crash"
+    assert payload["recovery_attempts"][0]["task_id"] == "TASK-001"
+    assert payload["recovery_attempts"][0]["recovery_kind"] == "diagnosis"
+
+
+def test_stop_command_writes_control_file_for_running_run(tmp_path: Path, monkeypatch) -> None:
+    repo = init_repo(tmp_path)
+    write_plan(repo)
+    monkeypatch.chdir(repo)
+
+    state_root = repo / ".git" / "ralph"
+    state_root.mkdir(parents=True, exist_ok=True)
+    from ralph_ng.state import StateStore
+
+    with StateStore(state_root / "state.db") as store:
+        store.create_run("ralph-plan.yaml", run_id="run-001", status="running", task_ids=["TASK-001"])
+
+    result = runner.invoke(app, ["stop", "--run-id", "run-001"])
+
+    assert result.exit_code == 0
+    assert "Stop requested for run run-001" in result.stdout
+    assert (state_root / "run-001.control").read_text(encoding="utf-8") == "pause"
+
+
+def test_doctor_reports_failure_and_recommendation(tmp_path: Path, monkeypatch) -> None:
+    repo = init_repo(tmp_path)
+    write_plan(repo)
+    monkeypatch.chdir(repo)
+
+    state_root = repo / ".git" / "ralph"
+    state_root.mkdir(parents=True, exist_ok=True)
+    from ralph_ng.state import StateStore
+
+    with StateStore(state_root / "state.db") as store:
+        store.create_run("ralph-plan.yaml", run_id="run-001", status="blocked_system", task_ids=["TASK-001"])
+        store.transition_task("run-001", "TASK-001", "blocked_system", attempt_count=2, last_error="provider crashed")
+        store.update_task_failure("run-001", "TASK-001", "provider_crash")
+        store.update_phase_checkpoint("run-001", "review:TASK-001:attempt:2")
+        store.connection.execute(
+            """
+            INSERT INTO recovery_attempts
+            (run_id, task_id, attempt_number, failure_class, recovery_kind, status, summary, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            ("run-001", "TASK-001", 2, "provider_crash", "diagnosis", "failed", "diagnosis failed", "2026-03-21T00:00:00+00:00"),
+        )
+        store.connection.commit()
+
+    result = runner.invoke(app, ["doctor", "--run-id", "run-001"])
+
+    assert result.exit_code == 0
+    assert "Run:" in result.stdout
+    assert "blocked_system" in result.stdout
+    assert "failure: provider_crash" in result.stdout
+    assert "review:TASK-001:attempt:2" in result.stdout
+    assert "Recovery attempts:" in result.stdout
+    assert "diagnosis" in result.stdout
+    assert "ralph resume --run-id run-001" in result.stdout
+
+
+def test_incidents_command_reports_failures_and_recovery_attempts(tmp_path: Path, monkeypatch) -> None:
+    repo = init_repo(tmp_path)
+    write_plan(repo)
+    monkeypatch.chdir(repo)
+
+    state_root = repo / ".git" / "ralph"
+    state_root.mkdir(parents=True, exist_ok=True)
+    from ralph_ng.state import StateStore
+
+    with StateStore(state_root / "state.db") as store:
+        store.create_run("ralph-plan.yaml", run_id="run-001", status="blocked_system", task_ids=["TASK-001"])
+        store.transition_task("run-001", "TASK-001", "blocked_system", attempt_count=1, last_error="provider crashed")
+        store.update_task_failure("run-001", "TASK-001", "provider_crash", '{"summary":"provider crashed hard"}')
+        store.connection.execute(
+            """
+            INSERT INTO recovery_attempts
+            (run_id, task_id, attempt_number, failure_class, recovery_kind, status, summary, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            ("run-001", "TASK-001", 1, "provider_crash", "diagnosis", "failed", "diagnosis failed", "2026-03-21T00:00:00+00:00"),
+        )
+        store.connection.commit()
+
+    result = runner.invoke(app, ["incidents", "--run-id", "run-001"])
+
+    assert result.exit_code == 0
+    assert "Incidents for run-001" in result.stdout
+    assert "failure_class: provider_crash" in result.stdout
+    assert "provider crashed hard" in result.stdout
+    assert "recovery: diagnosis failed" in result.stdout
 
 
 def test_start_refuses_dirty_tree(tmp_path: Path, monkeypatch) -> None:

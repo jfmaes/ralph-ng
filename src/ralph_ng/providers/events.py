@@ -19,6 +19,9 @@ class ProviderEventType(StrEnum):
 
     AGENT_STARTED = "agent.started"
     AGENT_COMMENTARY = "agent.commentary"
+    AGENT_THOUGHT_STARTED = "agent.thought_started"
+    AGENT_THOUGHT_DELTA = "agent.thought_delta"
+    AGENT_THOUGHT_FINISHED = "agent.thought_finished"
     AGENT_STDERR = "agent.stderr"
     AGENT_PROGRESS = "agent.progress"
     AGENT_STRUCTURED_OUTPUT = "agent.structured_output"

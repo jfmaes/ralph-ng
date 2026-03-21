@@ -6,6 +6,8 @@ from dataclasses import dataclass
 from enum import StrEnum
 import json
 from pathlib import Path
+import threading
+import time
 
 from .adapters.base import (
     ExecutorAdapter,
@@ -174,7 +176,9 @@ class Orchestrator:
         self.fsm = TaskFSM(store)
         self._rejection_counts: dict[str, int] = {}  # task_id → consecutive rejection count
         self._current_task_id: str | None = None  # for session management
-        self._shutdown_requested = __import__("threading").Event()
+        self._shutdown_requested = threading.Event()
+        self._heartbeat_stop = threading.Event()
+        self._heartbeat_thread: threading.Thread | None = None
         # Propagate cancel event to transports for mid-stream interruption
         for adapter in (self.executor, self.reviewer):
             transport = getattr(adapter, "transport", None)
@@ -197,11 +201,13 @@ class Orchestrator:
             task_ids=[task.id for task in self.plan.tasks],
         )
         self.store.acquire_controller(run_id, _os.getpid())
+        self._start_heartbeat(run_id)
         try:
             branch_name = self.git_manager.ensure_managed_branch(
                 plan_name=self.plan_path.stem,
                 run_id=run_id,
             )
+            self.store.update_phase_checkpoint(run_id, "run:started")
             self.events.log(
                 "run.started",
                 data={
@@ -212,6 +218,7 @@ class Orchestrator:
             )
             return self._run_loop(run_id)
         finally:
+            self._stop_heartbeat()
             stop_reason = None
             if self._shutdown_requested.is_set():
                 stop_reason = json.dumps({"cause": "operator_interrupt"})
@@ -223,11 +230,14 @@ class Orchestrator:
             raise OrchestratorError(f"Unknown run {run_id}.")
         self._ensure_run_paths(run_id)
         self.store.acquire_controller(run_id, _os.getpid())
+        self._start_heartbeat(run_id)
         self.store.update_run_status(run_id, RunStatus.RUNNING)
+        self.store.update_phase_checkpoint(run_id, "run:resumed")
         self.events.log("run.resumed", data={"run_id": run_id})
         try:
             return self._run_loop(run_id)
         finally:
+            self._stop_heartbeat()
             stop_reason = None
             if self._shutdown_requested.is_set():
                 stop_reason = json.dumps({"cause": "operator_interrupt"})
@@ -236,6 +246,36 @@ class Orchestrator:
     def request_shutdown(self) -> None:
         """Signal the orchestrator to pause at the next safe checkpoint."""
         self._shutdown_requested.set()
+
+    def _start_heartbeat(self, run_id: str, interval_seconds: float = 5.0) -> None:
+        """Start a controller-owned heartbeat loop on a dedicated DB connection."""
+        self._heartbeat_stop.clear()
+        self.store.update_heartbeat(run_id)
+
+        def _heartbeat_loop() -> None:
+            heartbeat_store = StateStore(self.store.db_path)
+            try:
+                while not self._heartbeat_stop.wait(interval_seconds):
+                    try:
+                        heartbeat_store.update_heartbeat(run_id)
+                    except Exception:
+                        break
+            finally:
+                heartbeat_store.close()
+
+        self._heartbeat_thread = threading.Thread(
+            target=_heartbeat_loop,
+            name=f"ralph-heartbeat-{run_id}",
+            daemon=True,
+        )
+        self._heartbeat_thread.start()
+
+    def _stop_heartbeat(self) -> None:
+        """Stop the background heartbeat loop."""
+        self._heartbeat_stop.set()
+        if self._heartbeat_thread is not None:
+            self._heartbeat_thread.join(timeout=2.0)
+            self._heartbeat_thread = None
 
     def _check_shutdown(self, run_id: str) -> RunOutcome | None:
         """Return a paused outcome if shutdown was requested, else None."""
@@ -372,6 +412,7 @@ class Orchestrator:
             self._transition(run_id, task.id, TaskState.READY, attempt_count=previous_attempt_count)
 
         attempt_number = previous_attempt_count + 1
+        self.store.update_phase_checkpoint(run_id, f"execute:{task.id}:attempt:{attempt_number}")
         if mode == TaskState.REPAIR:
             raw_error = current_record.last_error if current_record is not None else None
             # Restore persisted rejection count from structured payload
@@ -506,6 +547,7 @@ class Orchestrator:
         if record is None:
             raise OrchestratorError(f"Missing task state for {task.id}")
         attempt_number = record.attempt_count
+        self.store.update_phase_checkpoint(run_id, f"review:{task.id}:attempt:{attempt_number}")
         run_paths = self._ensure_run_paths(run_id)
         latest_attempt = self.store.get_latest_attempt(run_id, task.id)
         if latest_attempt is None:
@@ -750,6 +792,7 @@ class Orchestrator:
             task_id=task.id,
             data={"run_id": run_id, "attempt": attempt_number, "round": 2},
         )
+        self.store.update_phase_checkpoint(run_id, f"challenge_executor:{task.id}:attempt:{attempt_number}")
         self._set_activity_sink(
             tracker=self.executor_activity_tracker,
             run_id=run_id,
@@ -874,6 +917,7 @@ class Orchestrator:
             task_id=task.id,
             data={"run_id": run_id, "attempt": attempt_number, "round": 2},
         )
+        self.store.update_phase_checkpoint(run_id, f"challenge_reviewer:{task.id}:attempt:{attempt_number}")
         self._set_activity_sink(
             tracker=self.reviewer_activity_tracker,
             run_id=run_id,
@@ -936,6 +980,7 @@ class Orchestrator:
             ),
             encoding="utf-8",
         )
+        self.store.update_attempt_artifacts(latest_attempt.id, review_path=str(review_path))
 
         if final_result.status != InvocationStatus.COMPLETED or final_result.findings is None:
             return self._handle_blocked_system(
@@ -1191,12 +1236,20 @@ class Orchestrator:
             return
 
         def _sink(event: ActivityEvent) -> None:
-            event_type = {
-                ActivityKind.COMMENTARY: ProviderEventType.AGENT_COMMENTARY,
-                ActivityKind.PROGRESS: ProviderEventType.AGENT_PROGRESS,
-                ActivityKind.ERROR: ProviderEventType.AGENT_ERROR,
-                ActivityKind.RESULT: ProviderEventType.AGENT_STRUCTURED_OUTPUT,
-            }.get(event.kind)
+            if event.kind == ActivityKind.COMMENTARY and event.block_id is not None:
+                block_state = event.block_state or "update"
+                event_type = {
+                    "start": ProviderEventType.AGENT_THOUGHT_STARTED,
+                    "update": ProviderEventType.AGENT_THOUGHT_DELTA,
+                    "finish": ProviderEventType.AGENT_THOUGHT_FINISHED,
+                }.get(block_state, ProviderEventType.AGENT_THOUGHT_DELTA)
+            else:
+                event_type = {
+                    ActivityKind.COMMENTARY: ProviderEventType.AGENT_COMMENTARY,
+                    ActivityKind.PROGRESS: ProviderEventType.AGENT_PROGRESS,
+                    ActivityKind.ERROR: ProviderEventType.AGENT_ERROR,
+                    ActivityKind.RESULT: ProviderEventType.AGENT_STRUCTURED_OUTPUT,
+                }.get(event.kind)
             if event_type is None:
                 return
             self._emit_provider_event(
@@ -1207,7 +1260,13 @@ class Orchestrator:
                 role=role,
                 review_round=review_round,
                 event_type=event_type,
-                payload={"text": event.summary, "kind": event.kind.value},
+                payload={
+                    "text": event.text if event.text is not None else event.summary,
+                    "summary": event.summary,
+                    "kind": event.kind.value,
+                    "block_id": event.block_id,
+                    "block_state": event.block_state,
+                },
             )
 
         tracker.set_sink(_sink)

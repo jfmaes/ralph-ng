@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 import json
+import os
+from pathlib import Path
 from typing import Any
 
 from rich.console import Console, Group
@@ -284,12 +286,15 @@ class ProgressRenderer:
             and current_task is not None
             and current_task.state in ("in_progress", "review", "repair")
         ):
-            stale_seconds = self._seconds_since(run.updated_at)
-            if stale_seconds is not None and stale_seconds >= STALE_RUN_SECONDS:
+            controller_problem = self._controller_problem(run_id)
+            if controller_problem is not None:
+                stale_seconds, controller_dead = controller_problem
                 lines.append(Text.assemble(
                     ("Run heartbeat stale", "bold red"),
-                    f"  no store update for {self._format_duration_seconds(stale_seconds)}",
+                    f"  no controller heartbeat for {self._format_duration_seconds(stale_seconds)}",
                 ))
+                if controller_dead:
+                    lines.append(Text("  The recorded controller PID is no longer alive.", style="red"))
                 lines.append(Text(
                     "  The orchestrator process may have died or the active provider call may be wedged.",
                     style="red",
@@ -444,6 +449,15 @@ class ProgressRenderer:
                 (f"{risk_event.data.get('file_count', '?')} files", "dim"),
             ))
 
+        review_summary, review_findings = self._latest_review_summary(current_task)
+        if review_summary:
+            lines.append(Text.assemble(
+                ("review verdict: ", "bold"),
+                (review_summary, "yellow" if review_findings else "green"),
+            ))
+        for finding_line in review_findings[:3]:
+            lines.append(Text(f"  {finding_line}", style="red"))
+
         last_event = self._latest_task_event(
             run_events,
             task_id=current_task.task_id,
@@ -486,9 +500,9 @@ class ProgressRenderer:
             activity_lines = self.executor_activity.recent_lines
             if activity_lines:
                 for line in activity_lines[-3:]:
-                    grid.add_row(Text(f"  > {line}", style="dim italic", overflow="ellipsis", no_wrap=True))
+                    grid.add_row(Text(f"  {line}", style="dim italic"))
             elif self.executor_activity.latest_commentary:
-                grid.add_row(Text(f"  > {self.executor_activity.latest_commentary}", style="dim italic", overflow="ellipsis", no_wrap=True))
+                grid.add_row(Text(f"  {self.executor_activity.latest_commentary}", style="dim italic"))
             else:
                 grid.add_row(Text("  > waiting for provider output", style="dim italic"))
         else:
@@ -517,9 +531,9 @@ class ProgressRenderer:
             activity_lines = self.reviewer_activity.recent_lines
             if activity_lines:
                 for line in activity_lines[-3:]:
-                    grid.add_row(Text(f"  > {line}", style="dim italic", overflow="ellipsis", no_wrap=True))
+                    grid.add_row(Text(f"  {line}", style="dim italic"))
             elif self.reviewer_activity.latest_commentary:
-                grid.add_row(Text(f"  > {self.reviewer_activity.latest_commentary}", style="dim italic", overflow="ellipsis", no_wrap=True))
+                grid.add_row(Text(f"  {self.reviewer_activity.latest_commentary}", style="dim italic"))
             else:
                 grid.add_row(Text("  > waiting for provider output", style="dim italic"))
         else:
@@ -643,11 +657,13 @@ class ProgressRenderer:
 
         if self.executor_activity_tracker is not None:
             self.executor_activity.recent_lines = [
-                event.summary for event in self.executor_activity_tracker.recent_display(5)
+                self._format_activity_event(event)
+                for event in self.executor_activity_tracker.recent_display(5)
             ]
         if self.reviewer_activity_tracker is not None:
             self.reviewer_activity.recent_lines = [
-                event.summary for event in self.reviewer_activity_tracker.recent_display(5)
+                self._format_activity_event(event)
+                for event in self.reviewer_activity_tracker.recent_display(5)
             ]
 
         if self.provider_event_store is not None and current_task is not None:
@@ -670,12 +686,18 @@ class ProgressRenderer:
                     target.active = False
                     target.elapsed_seconds = event.payload.get("duration", 0.0)
                 elif event.event_type in (
+                    ProviderEventType.AGENT_THOUGHT_STARTED,
+                    ProviderEventType.AGENT_THOUGHT_DELTA,
+                    ProviderEventType.AGENT_THOUGHT_FINISHED,
                     ProviderEventType.AGENT_COMMENTARY,
                     ProviderEventType.AGENT_PROGRESS,
                     ProviderEventType.AGENT_STRUCTURED_OUTPUT,
                     ProviderEventType.AGENT_ERROR,
                 ):
-                    target.latest_commentary = event.payload.get("text", "")
+                    target.latest_commentary = (
+                        str(event.payload.get("summary", "")).strip()
+                        or str(event.payload.get("text", "")).strip()
+                    )
             if not self.executor_activity.recent_lines:
                 self.executor_activity.recent_lines = self._activity_lines_for_role(
                     events, "executor", limit=5,
@@ -722,6 +744,9 @@ class ProgressRenderer:
     ) -> list[str]:
         lines: list[str] = []
         preferred_types = {
+            ProviderEventType.AGENT_THOUGHT_STARTED,
+            ProviderEventType.AGENT_THOUGHT_DELTA,
+            ProviderEventType.AGENT_THOUGHT_FINISHED,
             ProviderEventType.AGENT_COMMENTARY,
             ProviderEventType.AGENT_STRUCTURED_OUTPUT,
             ProviderEventType.AGENT_ERROR,
@@ -729,17 +754,48 @@ class ProgressRenderer:
         fallback_types = preferred_types | {ProviderEventType.AGENT_PROGRESS}
 
         for allowed_types in (preferred_types, fallback_types):
-            lines = [
-                str(event.payload.get("text", "")).strip()
-                for event in events
-                if getattr(event, "role", None) == role
-                and getattr(event, "event_type", None) in allowed_types
-                and str(event.payload.get("text", "")).strip()
-            ]
+            lines = ProgressRenderer._summarize_provider_events(events, role, allowed_types)
             if lines:
                 break
 
         return lines[-limit:]
+
+    @staticmethod
+    def _format_activity_event(event) -> str:
+        text = str(getattr(event, "text", "") or event.summary).strip()
+        if getattr(event, "block_id", None):
+            return f"Thought: {text}"
+        return text
+
+    @staticmethod
+    def _summarize_provider_events(events: list, role: str, allowed_types: set) -> list[str]:
+        items: list[str] = []
+        thought_positions: dict[str, tuple[int, int]] = {}
+
+        for event in events:
+            if getattr(event, "role", None) != role or getattr(event, "event_type", None) not in allowed_types:
+                continue
+            text = str(event.payload.get("text", "")).strip()
+            if not text:
+                continue
+            if event.event_type in {
+                ProviderEventType.AGENT_THOUGHT_STARTED,
+                ProviderEventType.AGENT_THOUGHT_DELTA,
+                ProviderEventType.AGENT_THOUGHT_FINISHED,
+            }:
+                block_id = str(event.payload.get("block_id", "")).strip() or f"thought-{len(thought_positions) + 1}"
+                existing = thought_positions.get(block_id)
+                if existing is None:
+                    thought_number = len(thought_positions) + 1
+                    thought_positions[block_id] = (len(items), thought_number)
+                    items.append(f"Thought {thought_number}: {text}")
+                else:
+                    position, thought_number = existing
+                    items[position] = f"Thought {thought_number}: {text}"
+            else:
+                items.append(text)
+
+        return items
 
     def _verification_events(
         self,
@@ -771,6 +827,70 @@ class ProgressRenderer:
             for event in self.events.read_events()
             if event.data.get("run_id") == run_id
         ]
+
+    def _latest_review_summary(self, current_task: TaskStateRecord) -> tuple[str | None, list[str]]:
+        attempt = self.store.get_latest_attempt(current_task.run_id, current_task.task_id)
+        if attempt is None or attempt.review_path is None:
+            return None, []
+        path = Path(attempt.review_path)
+        if not path.exists():
+            return None, []
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, json.JSONDecodeError):
+            return None, []
+        findings_payload = payload.get("findings")
+        if not isinstance(findings_payload, dict):
+            return None, []
+        decision = str(findings_payload.get("decision", "")).strip()
+        confidence = findings_payload.get("confidence")
+        summary_text = str(findings_payload.get("summary", "")).strip()
+        summary = None
+        if decision:
+            if isinstance(confidence, (int, float)):
+                summary = f"{decision} ({confidence:.2f})"
+            else:
+                summary = decision
+        elif summary_text:
+            summary = summary_text
+
+        rendered_findings: list[str] = []
+        raw_findings = findings_payload.get("findings")
+        if isinstance(raw_findings, list):
+            for finding in raw_findings:
+                if not isinstance(finding, dict):
+                    continue
+                fid = str(finding.get("id", "?"))
+                severity = str(finding.get("severity", "?"))
+                category = str(finding.get("category", "?"))
+                description = str(finding.get("description", "")).strip()
+                if description:
+                    rendered_findings.append(f"{fid} [{severity}] ({category}): {description}")
+        return summary or summary_text or None, rendered_findings
+
+    def _controller_problem(self, run_id: str) -> tuple[int, bool] | None:
+        row = self.store.connection.execute(
+            "SELECT controller_pid, last_heartbeat_at FROM runs WHERE id = ?",
+            (run_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        controller_dead = False
+        pid = row["controller_pid"]
+        if pid is not None:
+            try:
+                os.kill(pid, 0)
+            except (ProcessLookupError, PermissionError):
+                controller_dead = True
+        heartbeat = row["last_heartbeat_at"]
+        if heartbeat is None:
+            return (0, controller_dead) if controller_dead else None
+        age = self._seconds_since(heartbeat)
+        if age is None:
+            return (0, controller_dead) if controller_dead else None
+        if age >= STALE_RUN_SECONDS or controller_dead:
+            return age, controller_dead
+        return None
 
     @staticmethod
     def _latest_task_event(

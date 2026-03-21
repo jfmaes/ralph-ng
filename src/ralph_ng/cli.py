@@ -40,6 +40,7 @@ from .verification import VerificationRunner
 
 # Global reference for signal handler access
 _active_orchestrator: Orchestrator | None = None
+_active_run_id: str | None = None
 _sigint_count = 0
 _sigint_lock = threading.Lock()
 
@@ -51,7 +52,6 @@ app = typer.Typer(
     context_settings={"help_option_names": ["-h", "--help"]},
 )
 console = Console()
-RUN_HEARTBEAT_SECONDS = 5.0
 _SIGINT_FORCE_WINDOW_SECONDS = 3.0
 
 
@@ -109,17 +109,16 @@ def _force_kill_children() -> None:
 def _emergency_release_controller() -> None:
     """Best-effort controller release on force quit — no exceptions allowed."""
     try:
-        if _active_orchestrator is None:
+        if _active_orchestrator is None or _active_run_id is None:
             return
         store = _active_orchestrator.store
-        # Find the current run_id from the store
-        run = store.get_latest_resumable_run()
+        run = store.get_run(_active_run_id)
         if run is not None and run.status == "running":
             store.release_controller(
-                run.id,
+                _active_run_id,
                 stop_reason='{"cause": "force_killed", "detail": "Double SIGINT"}',
             )
-            store.update_run_status(run.id, "paused")
+            store.update_run_status(_active_run_id, "paused")
     except Exception:
         pass  # best-effort — don't crash the emergency handler
 
@@ -138,8 +137,9 @@ def _install_signal_handlers(orchestrator: Orchestrator) -> tuple:
 
 def _restore_signal_handlers(prev_handlers: tuple) -> None:
     """Restore previous signal handlers."""
-    global _active_orchestrator
+    global _active_orchestrator, _active_run_id
     _active_orchestrator = None
+    _active_run_id = None
     prev_sigint, prev_sigterm = prev_handlers
     signal.signal(signal.SIGINT, prev_sigint)
     if os.name != "nt":
@@ -274,7 +274,6 @@ def run_with_progress(
 
     worker = threading.Thread(target=_target)
     worker.start()
-    last_heartbeat = time.monotonic()
 
     with Live(console=console, refresh_per_second=2, transient=False, vertical_overflow="visible") as live:
         while worker.is_alive():
@@ -284,13 +283,6 @@ def run_with_progress(
                 ))
             except KeyError:
                 pass
-            now = time.monotonic()
-            if now - last_heartbeat >= RUN_HEARTBEAT_SECONDS:
-                try:
-                    store.touch_run(run_id)
-                except KeyError:
-                    pass
-                last_heartbeat = now
             worker.join(timeout=0.1)
         if "error" in error_holder:
             raise error_holder["error"]
@@ -397,6 +389,21 @@ def start_command(
         plan_path = plan if plan.is_absolute() else repo_root / plan
         loaded_config = load_config(config_path)
         validated_plan = validate_plan_file(plan_path, base_dir=repo_root)
+        from .preflight import run_preflight
+
+        preflight = run_preflight(
+            repo_root=repo_root,
+            config=loaded_config,
+            plan=validated_plan,
+        )
+        if preflight.checks:
+            console.print("[bold]Preflight Checks[/bold]")
+            console.print(preflight.summary())
+            if not preflight.all_passed:
+                console.print(
+                    "[yellow]Continuing despite preflight warnings. "
+                    "The run may still succeed, but missing tools or a dirty workspace can cause later failures.[/yellow]"
+                )
         state_root = resolve_state_root(repo_root)
         state_root.mkdir(parents=True, exist_ok=True)
         # File lock to prevent concurrent starts
@@ -444,6 +451,8 @@ def start_command(
                 reviewer_activity_tracker=reviewer_tracker,
             )
             run_id = generate_run_id()
+            global _active_run_id
+            _active_run_id = run_id
             prev_handlers = _install_signal_handlers(orchestrator)
             try:
                 outcome = run_with_progress(
@@ -537,6 +546,8 @@ def resume_command(
                 executor_activity_tracker=executor_tracker,
                 reviewer_activity_tracker=reviewer_tracker,
             )
+            global _active_run_id
+            _active_run_id = run_id
             prev_handlers = _install_signal_handlers(orchestrator)
             try:
                 outcome = run_with_progress(
@@ -596,6 +607,7 @@ def status_command(
                 task_states = store.list_task_states(run_id)
                 summary = store.get_run_summary(run_id)
                 controller_alive = store.is_controller_alive(run_id)
+                recovery_attempts = store.list_recovery_attempts(run_id)
                 # Get controller details
                 ctrl_row = store.connection.execute(
                     "SELECT controller_pid, last_heartbeat_at, phase_checkpoint FROM runs WHERE id = ?",
@@ -618,17 +630,12 @@ def status_command(
                     if ts.state in ("in_progress", "review", "repair"):
                         current_task_id = tid
                         current_phase = ts.state
+                        current_failure = ts.failure_class
                         break
                     if ts.state in ("blocked_system", "blocked_human") and current_task_id is None:
                         current_task_id = tid
                         current_phase = ts.state
-                        # Check for failure class
-                        fail_row = store.connection.execute(
-                            "SELECT failure_class FROM task_states WHERE run_id = ? AND task_id = ?",
-                            (run_id, tid),
-                        ).fetchone()
-                        if fail_row and fail_row["failure_class"]:
-                            current_failure = fail_row["failure_class"]
+                        current_failure = ts.failure_class
 
                 output = {
                     "run_id": run_id,
@@ -641,7 +648,7 @@ def status_command(
                         tid: {
                             "state": ts.state,
                             "attempt_count": ts.attempt_count,
-                            "failure_class": ts.failure_class if hasattr(ts, "failure_class") else None,
+                            "failure_class": ts.failure_class,
                         }
                         for tid, ts in task_states.items()
                     },
@@ -653,6 +660,18 @@ def status_command(
                         "output_tokens": summary["invocations"]["output_tokens"],
                         "duration_seconds": summary["invocations"]["duration_seconds"],
                     },
+                    "recovery_attempts": [
+                        {
+                            "task_id": attempt.task_id,
+                            "attempt_number": attempt.attempt_number,
+                            "failure_class": attempt.failure_class,
+                            "recovery_kind": attempt.recovery_kind,
+                            "status": attempt.status,
+                            "summary": attempt.summary,
+                            "created_at": attempt.created_at,
+                        }
+                        for attempt in recovery_attempts[:10]
+                    ],
                 }
                 console.print(_json.dumps(output, indent=2))
                 return
@@ -859,24 +878,48 @@ def doctor_command(
             task_states = store.list_task_states(run_id)
             console.print(f"\n[bold]Tasks ({len(task_states)}):[/bold]")
             for tid, ts in task_states.items():
-                failure = ""
+                console.print(f"  {tid}: {ts.state} (attempt {ts.attempt_count})")
                 if ts.failure_class:
-                    failure = f" [failure: {ts.failure_class}]"
-                console.print(f"  {tid}: {ts.state} (attempt {ts.attempt_count}){failure}")
+                    console.print(f"    failure: {ts.failure_class}")
+                if ts.failure_detail_json:
+                    try:
+                        payload = json.loads(ts.failure_detail_json)
+                    except (TypeError, ValueError, json.JSONDecodeError):
+                        payload = None
+                    if isinstance(payload, dict):
+                        summary = str(payload.get("summary", "")).strip()
+                        if summary:
+                            console.print(f"    detail: {summary}")
+
+            recovery_attempts = store.list_recovery_attempts(run_id)
+            if recovery_attempts:
+                console.print("\n[bold]Recovery attempts:[/bold]")
+                for attempt in recovery_attempts[:8]:
+                    console.print(
+                        f"  {attempt.task_id}  {attempt.recovery_kind}  {attempt.status}  "
+                        f"[{attempt.failure_class}]"
+                    )
+                    if attempt.summary:
+                        console.print(f"    {attempt.summary}")
 
             # Recommendations
             console.print("\n[bold]Recommended action:[/bold]")
             if run.status == "running":
                 if row and row["controller_pid"] and store.is_controller_alive(run_id):
-                    console.print("  Run is actively controlled. Use `ralph watch --run-id {run_id}` to observe.")
+                    console.print(f"  Run is actively controlled.")
+                    console.print(f"  Observe with: ralph watch --run-id {run_id}")
                 else:
-                    console.print(f"  Controller is dead/stale. Run `ralph resume --run-id {run_id}` to adopt and continue.")
+                    console.print("  Controller is dead/stale.")
+                    console.print(f"  Resume with: ralph resume --run-id {run_id}")
             elif run.status == "paused":
-                console.print(f"  Run was paused. Run `ralph resume --run-id {run_id}` to continue.")
+                console.print("  Run was paused.")
+                console.print(f"  Resume with: ralph resume --run-id {run_id}")
             elif run.status == "blocked_human":
-                console.print(f"  Human intervention needed. Fix the issue, then `ralph resume --run-id {run_id}`.")
+                console.print("  Human intervention needed. Fix the issue first.")
+                console.print(f"  Resume with: ralph resume --run-id {run_id}")
             elif run.status == "blocked_system":
-                console.print(f"  System error. Check logs, fix environment, then `ralph resume --run-id {run_id}`.")
+                console.print("  System error. Check logs and fix the environment.")
+                console.print(f"  Resume with: ralph resume --run-id {run_id}")
             elif run.status == "completed":
                 console.print("  Run completed successfully. No action needed.")
             elif run.status == "failed_exhausted":
@@ -886,6 +929,93 @@ def doctor_command(
         raise
     except (OSError, ValueError) as exc:
         console.print(f"[red]Doctor failed:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+
+
+@app.command("incidents")
+def incidents_command(
+    run_id: str = typer.Option(..., "--run-id", help="Run identifier."),
+    json_output: bool = typer.Option(False, "--json", help="Output machine-readable JSON."),
+) -> None:
+    """Show task failures and recovery attempts for a run."""
+    import json as _json
+
+    try:
+        repo_root = resolve_repo_root()
+        state_root = resolve_state_root(repo_root)
+        with StateStore(state_root / "state.db") as store:
+            run = store.get_run(run_id)
+            if run is None:
+                raise ValueError(f"Run {run_id} does not exist.")
+
+            task_states = store.list_task_states(run_id)
+            recovery_attempts = store.list_recovery_attempts(run_id)
+
+            if json_output:
+                payload = {
+                    "run_id": run_id,
+                    "status": run.status,
+                    "task_failures": {
+                        task_id: {
+                            "state": record.state,
+                            "failure_class": record.failure_class,
+                            "failure_detail_json": record.failure_detail_json,
+                            "last_error": record.last_error,
+                        }
+                        for task_id, record in task_states.items()
+                        if record.failure_class or record.last_error
+                    },
+                    "recovery_attempts": [
+                        {
+                            "task_id": attempt.task_id,
+                            "attempt_number": attempt.attempt_number,
+                            "failure_class": attempt.failure_class,
+                            "recovery_kind": attempt.recovery_kind,
+                            "status": attempt.status,
+                            "summary": attempt.summary,
+                            "artifact_path": attempt.artifact_path,
+                            "created_at": attempt.created_at,
+                        }
+                        for attempt in recovery_attempts
+                    ],
+                }
+                console.print(_json.dumps(payload, indent=2))
+                return
+
+            console.print(f"[bold]Incidents for {run_id}[/bold]")
+            has_output = False
+            for task_id, record in task_states.items():
+                if not record.failure_class and not record.last_error:
+                    continue
+                has_output = True
+                console.print(f"\n[bold]{task_id}[/bold]  {record.state}")
+                if record.failure_class:
+                    console.print(f"  failure_class: {record.failure_class}")
+                if record.failure_detail_json:
+                    try:
+                        detail = _json.loads(record.failure_detail_json)
+                    except (TypeError, ValueError, _json.JSONDecodeError):
+                        detail = None
+                    if isinstance(detail, dict):
+                        summary = str(detail.get("summary", "")).strip()
+                        if summary:
+                            console.print(f"  detail: {summary}")
+                elif record.last_error:
+                    console.print(f"  last_error: {record.last_error}")
+
+                task_recoveries = store.list_recovery_attempts(run_id, task_id=task_id)
+                for attempt in task_recoveries[:5]:
+                    console.print(
+                        f"  recovery: {attempt.recovery_kind} {attempt.status} "
+                        f"[{attempt.failure_class}]"
+                    )
+                    if attempt.summary:
+                        console.print(f"    {attempt.summary}")
+
+            if not has_output:
+                console.print("No incidents recorded for this run.")
+    except (OSError, ValueError) as exc:
+        console.print(f"[red]Incidents failed:[/red] {exc}")
         raise typer.Exit(code=1) from exc
 
 

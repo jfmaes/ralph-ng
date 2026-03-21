@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import threading
-import time
 from typing import Callable
 
 from rich.text import Text
@@ -22,7 +21,6 @@ from .state import StateStore
 
 
 TERMINAL_STATES = {"completed", "blocked_human", "blocked_system", "failed_exhausted", "paused"}
-RUN_HEARTBEAT_SECONDS = 5.0
 
 
 class RalphDashboardApp(App[None]):
@@ -144,8 +142,6 @@ class RalphDashboardApp(App[None]):
         self.outcome_holder: dict[str, object] = {}
         self.error_holder: dict[str, BaseException] = {}
         self.worker: threading.Thread | None = None
-        self.last_heartbeat = time.monotonic()
-
         self._activity_context: tuple[str, int] | None = None
         self._executor_seen = 0
         self._reviewer_seen = 0
@@ -272,15 +268,6 @@ class RalphDashboardApp(App[None]):
         self._sync_activity_logs(current_task)
         self._sync_event_log(run_events)
 
-        if self.worker is not None and self.worker.is_alive():
-            now = time.monotonic()
-            if now - self.last_heartbeat >= RUN_HEARTBEAT_SECONDS:
-                try:
-                    self.store.touch_run(self.run_id)
-                except KeyError:
-                    pass
-                self.last_heartbeat = now
-
         if self.error_holder and self.worker is not None and not self.worker.is_alive():
             self.exit()
             return
@@ -313,32 +300,38 @@ class RalphDashboardApp(App[None]):
             self._executor_seen = 0
             self._reviewer_seen = 0
 
-        self._executor_seen = self._append_role_events(
-            executor_log, provider_events, "executor", self._executor_seen,
-        )
-        self._reviewer_seen = self._append_role_events(
-            reviewer_log, provider_events, "reviewer", self._reviewer_seen,
-        )
+        executor_events = self._collect_role_events(provider_events, "executor")
+        reviewer_events = self._collect_role_events(provider_events, "reviewer")
+
+        if len(executor_events) != self._executor_seen:
+            self._rewrite_role_log(executor_log, executor_events)
+            self._executor_seen = len(executor_events)
+        if len(reviewer_events) != self._reviewer_seen:
+            self._rewrite_role_log(reviewer_log, reviewer_events)
+            self._reviewer_seen = len(reviewer_events)
 
         if self._executor_seen == 0 and self.renderer.executor_activity.active:
+            executor_log.clear()
             executor_log.write(Text("waiting for provider output...", style="dim italic"))
             self._executor_seen = -1
         if self._reviewer_seen == 0 and self.renderer.reviewer_activity.active:
+            reviewer_log.clear()
             reviewer_log.write(Text("waiting for provider output...", style="dim italic"))
             self._reviewer_seen = -1
 
-    def _append_role_events(
+    def _collect_role_events(
         self,
-        log: RichLog,
         provider_events: list,
         role: str,
-        seen_count: int,
-    ) -> int:
+    ) -> list:
         textual = [
             event
             for event in provider_events
             if event.role == role
             and event.event_type in {
+                ProviderEventType.AGENT_THOUGHT_STARTED,
+                ProviderEventType.AGENT_THOUGHT_DELTA,
+                ProviderEventType.AGENT_THOUGHT_FINISHED,
                 ProviderEventType.AGENT_COMMENTARY,
                 ProviderEventType.AGENT_STRUCTURED_OUTPUT,
                 ProviderEventType.AGENT_ERROR,
@@ -353,28 +346,64 @@ class RalphDashboardApp(App[None]):
                 and event.event_type == ProviderEventType.AGENT_PROGRESS
                 and str(event.payload.get("text", "")).strip()
             ]
+        return textual
 
-        if seen_count == -1:
-            log.clear()
-            seen_count = 0
+    def _rewrite_role_log(self, log: RichLog, textual_events: list) -> None:
+        log.clear()
+        rendered_items = self._render_role_events(textual_events)
+        for item in rendered_items[-8:]:
+            log.write(item)
 
-        for event in textual[seen_count:]:
+    def _render_role_events(self, textual_events: list) -> list[Text]:
+        items: list[tuple[str, object]] = []
+        thought_positions: dict[str, tuple[int, int]] = {}
+
+        for event in textual_events:
             text = str(event.payload.get("text", "")).strip()
-            kind = event.payload.get("kind", "")
-            etype = event.event_type
-
-            if etype == ProviderEventType.AGENT_ERROR:
-                rendered = Text(f"ERROR: {text}", style="bold red")
-            elif etype == ProviderEventType.AGENT_STRUCTURED_OUTPUT:
-                rendered = Text(f"{text}", style="green")
-            elif kind == "progress":
-                rendered = Text(f"  {text}", style="dim")
+            if not text:
+                continue
+            if event.event_type in {
+                ProviderEventType.AGENT_THOUGHT_STARTED,
+                ProviderEventType.AGENT_THOUGHT_DELTA,
+                ProviderEventType.AGENT_THOUGHT_FINISHED,
+            }:
+                block_id = str(event.payload.get("block_id", "")).strip() or f"thought-{len(thought_positions) + 1}"
+                existing = thought_positions.get(block_id)
+                if existing is None:
+                    thought_number = len(thought_positions) + 1
+                    thought_positions[block_id] = (len(items), thought_number)
+                    items.append(("thought", (thought_number, text)))
+                else:
+                    position, thought_number = existing
+                    items[position] = ("thought", (thought_number, text))
             else:
-                # Commentary / reasoning — the main content
-                rendered = Text(text)
+                items.append(("event", event))
 
-            log.write(rendered)
-        return len(textual)
+        rendered: list[Text] = []
+        for kind, payload in items:
+            if kind == "thought":
+                thought_number, text = payload
+                body = "\n".join(f"  {line}" for line in str(text).splitlines()) or f"  {text}"
+                rendered.append(Text.assemble(
+                    (f"Thought {thought_number}", "bold cyan"),
+                    "\n",
+                    (body, "white"),
+                ))
+                continue
+
+            event = payload
+            text = str(event.payload.get("text", "")).strip()
+            event_type = event.event_type
+            if event_type == ProviderEventType.AGENT_ERROR:
+                rendered.append(Text(f"ERROR: {text}", style="bold red"))
+            elif event_type == ProviderEventType.AGENT_STRUCTURED_OUTPUT:
+                rendered.append(Text(text, style="green"))
+            elif event_type == ProviderEventType.AGENT_PROGRESS:
+                rendered.append(Text(f"  {text}", style="dim"))
+            else:
+                rendered.append(Text(text))
+
+        return rendered
 
     def _sync_event_log(self, run_events) -> None:
         event_log = self.query_one("#event-log", RichLog)

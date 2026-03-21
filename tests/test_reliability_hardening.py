@@ -10,6 +10,7 @@ from __future__ import annotations
 import os
 import tempfile
 import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -146,6 +147,17 @@ class TestStateStoreController:
             store.create_run("plan.yaml", run_id="run-1", task_ids=["T1"])
             assert store.is_controller_alive("run-1") is False
 
+    def test_is_controller_alive_stale_heartbeat(self, tmp_path):
+        with StateStore(tmp_path / "state.db") as store:
+            store.create_run("plan.yaml", run_id="run-1", task_ids=["T1"])
+            store.acquire_controller("run-1", os.getpid())
+            store.connection.execute(
+                "UPDATE runs SET last_heartbeat_at = ? WHERE id = ?",
+                ("2000-01-01T00:00:00+00:00", "run-1"),
+            )
+            store.connection.commit()
+            assert store.is_controller_alive("run-1", stale_threshold_seconds=30.0) is False
+
     def test_recovery_attempts_table_exists(self, tmp_path):
         with StateStore(tmp_path / "state.db") as store:
             store.create_run("plan.yaml", run_id="run-1", task_ids=["T1"])
@@ -275,3 +287,42 @@ class TestOrchestratorShutdown:
         assert not orch._shutdown_requested.is_set()
         orch.request_shutdown()
         assert orch._shutdown_requested.is_set()
+
+    def test_background_heartbeat_updates_controller_timestamp(self, tmp_path):
+        from ralph_ng.events import EventLogger
+        from ralph_ng.orchestrator import Orchestrator
+        from ralph_ng.plan import Plan
+        from unittest.mock import MagicMock
+
+        store = StateStore(tmp_path / "state.db")
+        store.create_run("plan.yaml", run_id="run-1", task_ids=[])
+        store.acquire_controller("run-1", os.getpid())
+
+        before = store.connection.execute(
+            "SELECT last_heartbeat_at FROM runs WHERE id = 'run-1'"
+        ).fetchone()["last_heartbeat_at"]
+
+        orch = Orchestrator(
+            repo_root=tmp_path,
+            plan=Plan.model_validate({"tasks": []}),
+            plan_path=tmp_path / "plan.yaml",
+            config=RalphConfig(),
+            state_root=tmp_path / "state-root",
+            store=store,
+            events=EventLogger(tmp_path / "events.jsonl"),
+            git_manager=MagicMock(),
+            prompt_builder=MagicMock(),
+            executor=MagicMock(),
+            reviewer=MagicMock(),
+            verification_runner=MagicMock(),
+            review_bundle_builder=MagicMock(),
+        )
+
+        orch._start_heartbeat("run-1", interval_seconds=0.05)
+        time.sleep(0.12)
+        orch._stop_heartbeat()
+
+        after = store.connection.execute(
+            "SELECT last_heartbeat_at FROM runs WHERE id = 'run-1'"
+        ).fetchone()["last_heartbeat_at"]
+        assert after >= before

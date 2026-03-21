@@ -65,6 +65,8 @@ class CliClaudeTransport(Transport):
         self._pending_tool_input_chunks: list[str] = []
         # Buffer for accumulating text_delta chunks into readable commentary
         self._text_buffer: list[str] = []
+        self._thought_counter = 0
+        self._current_thought_id: str | None = None
         # Session ID for --resume (set after each successful invocation)
         self.session_id: str | None = None
         # Cancel event for graceful mid-stream interruption
@@ -85,6 +87,7 @@ class CliClaudeTransport(Transport):
         self._pending_tool_name = ""
         self._pending_tool_input_chunks = []
         self._text_buffer = []
+        self._current_thought_id = None
 
         # Accumulated state from streaming
         text_parts: list[str] = []
@@ -220,7 +223,11 @@ class CliClaudeTransport(Transport):
         """Check if the claude CLI is available on PATH."""
         return shutil.which(self.cli_path) is not None
 
-    def _flush_text_buffer(self) -> None:
+    def _start_thought(self) -> None:
+        self._thought_counter += 1
+        self._current_thought_id = f"claude-thought-{self._thought_counter}"
+
+    def _flush_text_buffer(self, *, final: bool = False) -> None:
         """Flush accumulated text_delta chunks as a commentary event."""
         if not self._text_buffer or self.tracker is None:
             return
@@ -228,21 +235,47 @@ class CliClaudeTransport(Transport):
         self._text_buffer = []
         if not full:
             return
-        self._push_reasoning(full)
+        self._push_reasoning(full, final=final)
 
-    def _push_reasoning(self, text: str) -> None:
-        """Push commentary text as one or more activity events."""
+    def _push_reasoning(
+        self,
+        text: str,
+        *,
+        final: bool = False,
+        force_new: bool = False,
+    ) -> None:
+        """Push commentary text as a grouped thought block."""
         assert self.tracker is not None
         if not text:
             return
         stripped = text.strip()
         if not stripped:
             return
-        lines = stripped.splitlines()
-        for line in lines:
+        if force_new or self._current_thought_id is None:
+            self._start_thought()
+
+        summary = stripped
+        for line in reversed(stripped.splitlines()):
             line = line.strip()
             if line:
-                self.tracker.push(make_activity(ActivityKind.COMMENTARY, line))
+                summary = line
+                break
+
+        block_state = "update"
+        if force_new:
+            block_state = "start"
+        elif final:
+            block_state = "finish"
+
+        self.tracker.push(make_activity(
+            ActivityKind.COMMENTARY,
+            summary[:80],
+            text=stripped,
+            block_id=self._current_thought_id,
+            block_state=block_state,
+        ))
+        if final:
+            self._current_thought_id = None
 
     def _extract_activity(self, event: dict[str, Any]) -> None:
         """Extract tool-use and commentary activity from Claude stream-json events.
@@ -285,6 +318,7 @@ class CliClaudeTransport(Transport):
                 self._pending_tool_name = cb.get("name", "")
                 self._pending_tool_input_chunks = []
             elif isinstance(cb, dict) and cb.get("type") == "text":
+                self._start_thought()
                 self.tracker.push(make_activity(ActivityKind.PROGRESS, "thinking"))
 
         # ── Tool use: accumulate input / CoT text ────────────────────
@@ -335,11 +369,11 @@ class CliClaudeTransport(Transport):
                 self._pending_tool_input_chunks = []
             else:
                 # End of a text block — flush remaining text
-                self._flush_text_buffer()
+                self._flush_text_buffer(final=True)
 
         # ── Message boundaries ────────────────────────────────────────
         elif event_type in ("message_stop", "message_delta"):
-            self._flush_text_buffer()
+            self._flush_text_buffer(final=(event_type == "message_stop"))
             if event_type == "message_stop":
                 self.tracker.push(make_activity(ActivityKind.RESULT, "response complete"))
 
@@ -393,7 +427,7 @@ class CliClaudeTransport(Transport):
                 continue
             block_type = block.get("type", "")
             if block_type == "thinking":
-                self._push_reasoning(block.get("thinking", ""))
+                self._push_reasoning(block.get("thinking", ""), final=True, force_new=True)
             elif block_type == "tool_use":
                 tool_name = block.get("name", "")
                 kind = _TOOL_KIND_MAP.get(tool_name, ActivityKind.TOOL_OTHER)
@@ -404,7 +438,7 @@ class CliClaudeTransport(Transport):
             elif block_type == "text":
                 text = block.get("text", "")
                 if text and not self._looks_like_json(text):
-                    self._push_reasoning(text)
+                    self._push_reasoning(text, final=True, force_new=True)
                 elif text:
                     self.tracker.push(make_activity(ActivityKind.RESULT, "structured text output received"))
 
