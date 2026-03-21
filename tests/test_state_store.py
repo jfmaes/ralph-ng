@@ -63,3 +63,12 @@ def test_state_store_supports_context_manager(tmp_path: Path) -> None:
 
     reopened = StateStore(db_path)
     assert reopened.get_run("run-ctx") is not None
+
+
+def test_touch_run_updates_timestamp(tmp_path: Path) -> None:
+    store = StateStore(tmp_path / "state.db")
+    created = store.create_run("ralph-plan.yaml", run_id="run-001")
+
+    touched = store.touch_run("run-001")
+
+    assert touched.updated_at >= created.updated_at

@@ -24,14 +24,14 @@ def test_review_bundle_includes_task_diff_results_repairs_and_overlay_history(fi
         task,
         git_diff="diff --git a/example b/example",
         verification_results=verification_results,
-        repair_notes="Address the evaluator feedback.",
+        repair_notes="Address the reviewer feedback.",
         ratchet_overlay_history=["pytest tests/test_regression.py -x"],
     )
 
     assert bundle.task.id == "TASK-001"
     assert bundle.git_diff == "diff --git a/example b/example"
     assert bundle.verification_results[0].stdout == "passed"
-    assert bundle.repair_notes == "Address the evaluator feedback."
+    assert bundle.repair_notes == "Address the reviewer feedback."
     assert bundle.ratchet_overlay_history == ["pytest tests/test_regression.py -x"]
     assert "project/src/existing_module.py" in bundle.changed_file_snippets
     assert "def existing() -> str:" in bundle.changed_file_snippets["project/src/existing_module.py"]

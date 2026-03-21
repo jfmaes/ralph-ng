@@ -1,10 +1,12 @@
 """Model CLI adapters."""
 
-from .base import EvaluatorResult, EvaluatorVerdict, ExecutorResult, InvocationStatus
+from .base import ExecutorResult, InvocationStatus, ReviewerAdapter
+from .transport import Transport, TransportResult
 
 __all__ = [
-    "EvaluatorResult",
-    "EvaluatorVerdict",
     "ExecutorResult",
     "InvocationStatus",
+    "ReviewerAdapter",
+    "Transport",
+    "TransportResult",
 ]

@@ -11,7 +11,6 @@ def test_loads_valid_config(fixtures_dir: Path) -> None:
     assert config.ralph.branch_prefix == "ralph/test/"
     assert config.ralph.auto_push is True
     assert config.models.executor == "haiku"
-    assert config.models.evaluator == "opus"
     assert config.models.cli == "claude"
     assert config.timeouts.executor_call_seconds == 900
     assert config.git.protected_branches == ["main", "release"]

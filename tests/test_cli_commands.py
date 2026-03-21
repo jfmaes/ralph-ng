@@ -1,18 +1,15 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 import subprocess
 import sys
 
 from typer.testing import CliRunner
 
-from ralph_ng.adapters.base import (
-    EvaluatorResult,
-    EvaluatorVerdict,
-    ExecutorResult,
-    InvocationStatus,
-)
+from ralph_ng.adapters.base import ExecutorResult, InvocationStatus
 from ralph_ng.cli import app
+from ralph_ng.review_findings import ReviewResult, ReviewFindings
 
 
 runner = CliRunner()
@@ -45,8 +42,19 @@ def init_repo(path: Path) -> Path:
                 "",
                 "[models]",
                 "executor = \"sonnet\"",
-                "evaluator = \"opus\"",
                 "cli = \"claude\"",
+                "",
+                "[roles.executor]",
+                "provider = \"claude\"",
+                "transport = \"cli\"",
+                "model = \"sonnet\"",
+                "cli_path = \"claude\"",
+                "",
+                "[roles.reviewer]",
+                "provider = \"codex\"",
+                "transport = \"cli\"",
+                "model = \"gpt-5.3-codex\"",
+                "cli_path = \"codex\"",
             ]
         ),
         encoding="utf-8",
@@ -106,16 +114,20 @@ class FakeExecutor:
         )
 
 
-class FakeEvaluator:
-    def evaluate(self, review_bundle, *, timeout_seconds: int | float, cwd: str | Path | None = None) -> EvaluatorResult:
-        return EvaluatorResult(
+class FakeReviewer:
+    def review(self, prompt: str, *, timeout_seconds: int | float, cwd: str | None = None) -> ReviewResult:
+        return ReviewResult(
             status=InvocationStatus.COMPLETED,
-            output_text="ok",
+            findings=ReviewFindings(
+                decision="accept",
+                confidence=0.95,
+                spec_compliance="pass",
+                summary="ok",
+                findings=[],
+            ),
             input_tokens=5,
             output_tokens=5,
             duration_seconds=0.01,
-            exit_status=0,
-            verdict=EvaluatorVerdict(decision="accept", summary="ok"),
         )
 
 
@@ -139,8 +151,8 @@ def test_start_creates_run_and_begins_execution(tmp_path: Path, monkeypatch) -> 
     write_plan(repo)
     monkeypatch.chdir(repo)
     monkeypatch.setattr("ralph_ng.cli.generate_run_id", lambda: "run-001")
-    monkeypatch.setattr("ralph_ng.cli.build_executor_adapter", lambda config: FakeExecutor(repo))
-    monkeypatch.setattr("ralph_ng.cli.build_evaluator_adapter", lambda config: FakeEvaluator())
+    monkeypatch.setattr("ralph_ng.cli.build_executor", lambda config, **kw: FakeExecutor(repo))
+    monkeypatch.setattr("ralph_ng.cli.build_reviewer", lambda config, **kw: FakeReviewer())
 
     result = runner.invoke(app, ["start"])
 
@@ -156,13 +168,13 @@ def test_resume_loads_existing_run(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.chdir(repo)
     monkeypatch.setattr("ralph_ng.cli.generate_run_id", lambda: "run-001")
     monkeypatch.setattr(
-        "ralph_ng.cli.build_executor_adapter",
-        lambda config: FakeExecutor(repo, rate_limited=True),
+        "ralph_ng.cli.build_executor",
+        lambda config, **kw: FakeExecutor(repo, rate_limited=True),
     )
-    monkeypatch.setattr("ralph_ng.cli.build_evaluator_adapter", lambda config: FakeEvaluator())
+    monkeypatch.setattr("ralph_ng.cli.build_reviewer", lambda config, **kw: FakeReviewer())
     start = runner.invoke(app, ["start"])
     assert start.exit_code == 0
-    monkeypatch.setattr("ralph_ng.cli.build_executor_adapter", lambda config: FakeExecutor(repo))
+    monkeypatch.setattr("ralph_ng.cli.build_executor", lambda config, **kw: FakeExecutor(repo))
 
     result = runner.invoke(app, ["resume", "--run-id", "run-001"])
 
@@ -170,20 +182,41 @@ def test_resume_loads_existing_run(tmp_path: Path, monkeypatch) -> None:
     assert "completed" in result.stdout
 
 
+def test_start_refuses_when_resumable_run_exists(tmp_path: Path, monkeypatch) -> None:
+    repo = init_repo(tmp_path)
+    write_plan(repo)
+    monkeypatch.chdir(repo)
+    monkeypatch.setattr("ralph_ng.cli.generate_run_id", lambda: "run-001")
+    monkeypatch.setattr(
+        "ralph_ng.cli.build_executor",
+        lambda config, **kw: FakeExecutor(repo, rate_limited=True),
+    )
+    monkeypatch.setattr("ralph_ng.cli.build_reviewer", lambda config, **kw: FakeReviewer())
+
+    first = runner.invoke(app, ["start"])
+    assert first.exit_code == 0
+
+    second = runner.invoke(app, ["start"])
+
+    assert second.exit_code == 1
+    assert "ralph resume --run-id" in second.stdout
+    assert "run-001" in second.stdout
+
+
 def test_status_displays_run_info(tmp_path: Path, monkeypatch) -> None:
     repo = init_repo(tmp_path)
     write_plan(repo)
     monkeypatch.chdir(repo)
     monkeypatch.setattr("ralph_ng.cli.generate_run_id", lambda: "run-001")
-    monkeypatch.setattr("ralph_ng.cli.build_executor_adapter", lambda config: FakeExecutor(repo))
-    monkeypatch.setattr("ralph_ng.cli.build_evaluator_adapter", lambda config: FakeEvaluator())
+    monkeypatch.setattr("ralph_ng.cli.build_executor", lambda config, **kw: FakeExecutor(repo))
+    monkeypatch.setattr("ralph_ng.cli.build_reviewer", lambda config, **kw: FakeReviewer())
     runner.invoke(app, ["start"])
 
     result = runner.invoke(app, ["status", "--run-id", "run-001"])
 
     assert result.exit_code == 0
     assert "run-001" in result.stdout
-    assert "completed" in result.stdout
+    assert "COMPLETED" in result.stdout
 
 
 def test_start_refuses_dirty_tree(tmp_path: Path, monkeypatch) -> None:
@@ -192,8 +225,8 @@ def test_start_refuses_dirty_tree(tmp_path: Path, monkeypatch) -> None:
     (repo / "work.txt").write_text("dirty\n", encoding="utf-8")
     monkeypatch.chdir(repo)
     monkeypatch.setattr("ralph_ng.cli.generate_run_id", lambda: "run-001")
-    monkeypatch.setattr("ralph_ng.cli.build_executor_adapter", lambda config: FakeExecutor(repo))
-    monkeypatch.setattr("ralph_ng.cli.build_evaluator_adapter", lambda config: FakeEvaluator())
+    monkeypatch.setattr("ralph_ng.cli.build_executor", lambda config, **kw: FakeExecutor(repo))
+    monkeypatch.setattr("ralph_ng.cli.build_reviewer", lambda config, **kw: FakeReviewer())
 
     result = runner.invoke(app, ["start"])
 

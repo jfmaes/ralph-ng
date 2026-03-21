@@ -6,9 +6,12 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from enum import StrEnum
 import json
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field
+
+if TYPE_CHECKING:
+    from ..review_findings import ReviewResult
 
 
 class InvocationStatus(StrEnum):
@@ -29,37 +32,12 @@ class AdapterResult(BaseModel):
     duration_seconds: float
     exit_status: int
     error_message: str | None = None
+    stderr_text: str = ""
     raw_events: list[dict[str, Any]] = Field(default_factory=list)
 
 
 class ExecutorResult(AdapterResult):
     model_config = ConfigDict(extra="forbid")
-
-
-class EvaluatorVerdict(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    decision: str
-    repair_notes: str = ""
-    new_verification_commands: list[str] = Field(default_factory=list)
-    summary: str
-
-    @model_validator(mode="after")
-    def validate_decision_specific_fields(self) -> "EvaluatorVerdict":
-        if self.decision not in {"accept", "reject"}:
-            raise ValueError("decision must be either 'accept' or 'reject'")
-        if self.decision == "reject":
-            if not self.repair_notes.strip():
-                raise ValueError("reject verdicts must include repair_notes")
-            if not self.new_verification_commands:
-                raise ValueError("reject verdicts must include new_verification_commands")
-        return self
-
-
-class EvaluatorResult(AdapterResult):
-    model_config = ConfigDict(extra="forbid")
-
-    verdict: EvaluatorVerdict | None = None
 
 
 @dataclass(slots=True)
@@ -82,37 +60,21 @@ class ExecutorAdapter(ABC):
         """Run the executor model."""
 
 
-class EvaluatorAdapter(ABC):
+class ReviewerAdapter(ABC):
+    """ABC for reviewer adapters.
+
+    Produces ReviewResult with severity-graded, evidence-backed findings.
+    """
+
     @abstractmethod
-    def evaluate(
+    def review(
         self,
-        review_bundle: str,
+        prompt: str,
         *,
         timeout_seconds: int | float,
         cwd: str | None = None,
-    ) -> EvaluatorResult:
-        """Run the evaluator model."""
-
-
-def build_claude_command(cli_path: str, model: str, prompt: str) -> list[str]:
-    return [cli_path, "-p", prompt, "--model", model, "--output-format", "stream-json"]
-
-
-def classify_invocation_error(
-    error_type: str | None,
-    error_message: str | None,
-    stderr: str,
-    returncode: int,
-) -> tuple[InvocationStatus, str] | None:
-    stderr_lower = stderr.lower()
-    if error_type is not None or "rate limit" in stderr_lower:
-        message = error_message or stderr or "provider reported an error"
-        if "rate_limit" in (error_type or "") or "rate limit" in message.lower():
-            return InvocationStatus.RATE_LIMITED, message
-        return InvocationStatus.PROVIDER_ERROR, message
-    if returncode != 0:
-        return InvocationStatus.PROVIDER_ERROR, stderr or f"Claude exited with status {returncode}"
-    return None
+    ) -> ReviewResult:
+        """Run the reviewer model and return structured findings."""
 
 
 def parse_stream_json(stdout: str) -> ParsedStream:

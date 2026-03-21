@@ -6,14 +6,25 @@ max_ratchet_checks_per_task = 10
 
 [models]
 executor = "sonnet"
-evaluator = "opus"
 cli = "claude"
 
 [timeouts]
 executor_call_seconds = 30
 verification_command_seconds = 5
-evaluator_call_seconds = 30
+reviewer_call_seconds = 30
 
 [git]
 protected_branches = ["main", "master"]
 force_push = false
+
+[roles.executor]
+provider = "claude"
+transport = "cli"
+model = "sonnet"
+cli_path = "claude"
+
+[roles.reviewer]
+provider = "codex"
+transport = "cli"
+model = "gpt-5.3-codex"
+cli_path = "codex"

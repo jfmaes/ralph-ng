@@ -29,6 +29,8 @@ class TaskStateRecord:
     attempt_count: int
     last_error: str | None
     updated_at: str
+    failure_class: str | None = None
+    failure_detail_json: str | None = None
 
 
 @dataclass(slots=True)
@@ -63,7 +65,7 @@ class StateStore:
     def __init__(self, db_path: str | Path) -> None:
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        self.connection = sqlite3.connect(self.db_path)
+        self.connection = sqlite3.connect(self.db_path, check_same_thread=False)
         self.connection.row_factory = sqlite3.Row
         self.connection.execute("PRAGMA journal_mode=WAL")
         self._initialize_schema()
@@ -126,6 +128,38 @@ class StateStore:
             );
             """
         )
+        # Schema migrations for reliability hardening
+        for col_sql in [
+            "ALTER TABLE runs ADD COLUMN controller_pid INTEGER",
+            "ALTER TABLE runs ADD COLUMN controller_started_at TEXT",
+            "ALTER TABLE runs ADD COLUMN last_heartbeat_at TEXT",
+            "ALTER TABLE runs ADD COLUMN stop_reason TEXT",
+            "ALTER TABLE runs ADD COLUMN phase_checkpoint TEXT",
+            "ALTER TABLE task_states ADD COLUMN failure_class TEXT",
+            "ALTER TABLE task_states ADD COLUMN failure_detail_json TEXT",
+        ]:
+            try:
+                self.connection.execute(col_sql)
+            except sqlite3.OperationalError:
+                pass  # column already exists
+
+        # Phase 4: recovery_attempts table for self-healing
+        self.connection.execute("""
+            CREATE TABLE IF NOT EXISTS recovery_attempts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                run_id TEXT NOT NULL,
+                task_id TEXT NOT NULL,
+                attempt_number INTEGER NOT NULL,
+                failure_class TEXT NOT NULL,
+                recovery_kind TEXT NOT NULL,
+                status TEXT NOT NULL,
+                summary TEXT,
+                artifact_path TEXT,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY (run_id) REFERENCES runs(id)
+            )
+        """)
+
         self.connection.commit()
 
     def create_run(
@@ -192,10 +226,41 @@ class StateStore:
             raise KeyError(f"Unknown run_id: {run_id}")
         return record
 
+    def get_latest_resumable_run(self) -> RunRecord | None:
+        row = self.connection.execute(
+            """
+            SELECT id, plan_path, status, created_at, updated_at
+            FROM runs
+            WHERE status IN ('running', 'blocked_human', 'blocked_system', 'paused')
+            ORDER BY created_at DESC
+            LIMIT 1
+            """
+        ).fetchone()
+        if row is None:
+            return None
+        return RunRecord(**dict(row))
+
+    def touch_run(self, run_id: str) -> RunRecord:
+        timestamp = utc_now()
+        self.connection.execute(
+            """
+            UPDATE runs
+            SET updated_at = ?, last_heartbeat_at = ?
+            WHERE id = ?
+            """,
+            (timestamp, timestamp, run_id),
+        )
+        self.connection.commit()
+        record = self.get_run(run_id)
+        if record is None:
+            raise KeyError(f"Unknown run_id: {run_id}")
+        return record
+
     def get_task_state(self, run_id: str, task_id: str) -> TaskStateRecord | None:
         row = self.connection.execute(
             """
-            SELECT run_id, task_id, state, attempt_count, last_error, updated_at
+            SELECT run_id, task_id, state, attempt_count, last_error, updated_at,
+                   failure_class, failure_detail_json
             FROM task_states
             WHERE run_id = ? AND task_id = ?
             """,
@@ -208,7 +273,8 @@ class StateStore:
     def list_task_states(self, run_id: str) -> dict[str, TaskStateRecord]:
         rows = self.connection.execute(
             """
-            SELECT run_id, task_id, state, attempt_count, last_error, updated_at
+            SELECT run_id, task_id, state, attempt_count, last_error, updated_at,
+                   failure_class, failure_detail_json
             FROM task_states
             WHERE run_id = ?
             ORDER BY task_id
@@ -444,3 +510,92 @@ class StateStore:
             "attempt_count": attempts["count"],
             "invocations": dict(invocation_totals),
         }
+
+    def get_invocation_counts(self, run_id: str) -> dict[str, int]:
+        """Return per-role invocation counts for a run."""
+        rows = self.connection.execute(
+            """
+            SELECT role, COUNT(*) AS count
+            FROM invocations
+            WHERE run_id = ?
+            GROUP BY role
+            """,
+            (run_id,),
+        ).fetchall()
+        return {row["role"]: row["count"] for row in rows}
+
+    def acquire_controller(self, run_id: str, pid: int) -> None:
+        """Record that this process is the active controller."""
+        timestamp = utc_now()
+        self.connection.execute(
+            "UPDATE runs SET controller_pid = ?, controller_started_at = ?, last_heartbeat_at = ? WHERE id = ?",
+            (pid, timestamp, timestamp, run_id),
+        )
+        self.connection.commit()
+
+    def update_heartbeat(self, run_id: str) -> None:
+        """Update the heartbeat timestamp for the active controller."""
+        timestamp = utc_now()
+        self.connection.execute(
+            "UPDATE runs SET last_heartbeat_at = ? WHERE id = ?",
+            (timestamp, run_id),
+        )
+        self.connection.commit()
+
+    def release_controller(self, run_id: str, stop_reason: str | None = None) -> None:
+        """Release controller ownership."""
+        timestamp = utc_now()
+        self.connection.execute(
+            "UPDATE runs SET controller_pid = NULL, last_heartbeat_at = ?, stop_reason = ? WHERE id = ?",
+            (timestamp, stop_reason, run_id),
+        )
+        self.connection.commit()
+
+    def update_phase_checkpoint(self, run_id: str, checkpoint: str) -> None:
+        """Update the phase checkpoint for the active task."""
+        self.connection.execute(
+            "UPDATE runs SET phase_checkpoint = ? WHERE id = ?",
+            (checkpoint, run_id),
+        )
+        self.connection.commit()
+
+    def update_task_failure(self, run_id: str, task_id: str, failure_class: str, failure_detail_json: str | None = None) -> None:
+        """Record a structured failure classification on a task."""
+        self.connection.execute(
+            "UPDATE task_states SET failure_class = ?, failure_detail_json = ? WHERE run_id = ? AND task_id = ?",
+            (failure_class, failure_detail_json, run_id, task_id),
+        )
+        self.connection.commit()
+
+    def is_controller_alive(self, run_id: str, stale_threshold_seconds: float = 30.0) -> bool:
+        """Check if the controller for a run is still alive."""
+        import os
+        from datetime import datetime, UTC
+        run = self.get_run(run_id)
+        if run is None:
+            return False
+        row = self.connection.execute(
+            "SELECT controller_pid, last_heartbeat_at FROM runs WHERE id = ?",
+            (run_id,),
+        ).fetchone()
+        if row is None:
+            return False
+        pid = row["controller_pid"]
+        heartbeat = row["last_heartbeat_at"]
+        if pid is None:
+            return False
+        # Check if PID is alive
+        try:
+            os.kill(pid, 0)
+        except (ProcessLookupError, PermissionError):
+            return False
+        # Check heartbeat freshness
+        if heartbeat is not None:
+            try:
+                last = datetime.fromisoformat(heartbeat)
+                now = datetime.now(UTC)
+                if (now - last).total_seconds() > stale_threshold_seconds:
+                    return False
+            except (ValueError, TypeError):
+                pass
+        return True

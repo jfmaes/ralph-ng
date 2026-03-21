@@ -1,0 +1,88 @@
+# ralph-ng v0.2 mixed-provider configuration
+#
+# This config runs Claude as the code executor and Codex as the adversarial
+# reviewer. The [roles] section selects providers per role; the [review]
+# section controls the adversarial review protocol.
+#
+# To use this config:  ralph start --config ralph.toml
+
+[ralph]
+branch_prefix = "ralph/"
+auto_push = false
+max_retries_per_task = 3
+max_ratchet_checks_per_task = 10
+
+# Legacy [models] section — fallback for executor when [roles] is absent.
+[models]
+executor = "sonnet"
+cli = "claude"
+
+[timeouts]
+executor_call_seconds = 600
+verification_command_seconds = 120
+reviewer_call_seconds = 300
+
+[git]
+protected_branches = ["main", "master"]
+force_push = false
+
+# --- v0.2: Role-based adapter selection ---
+
+[roles.executor]
+provider = "claude"           # "claude" or "codex"
+transport = "cli"             # "cli" now; "api" in v0.3
+model = "sonnet"
+cli_path = "claude"
+# base_url = ""              # reserved for v0.3 API transport
+# api_key_env = ""           # reserved for v0.3 API transport
+
+[roles.reviewer]
+provider = "codex"
+transport = "cli"
+model = "gpt-5.3-codex"
+cli_path = "codex"
+reasoning_effort = "medium"         # codex-only: low, medium, high, xhigh
+service_tier = "fast"               # codex-only: avoids inheriting personal CLI defaults
+
+# --- v0.2: Adversarial review protocol ---
+
+[review]
+enabled = true
+stages = ["spec_compliance", "code_quality"]
+
+[review.thresholds]
+auto_accept_min_confidence = 0.95     # accept without challenge if confidence >= this
+challenge_below_confidence = 0.80     # challenge an accept if confidence < this
+auto_reject_min_confidence = 0.90     # reject without challenge if confidence >= this
+challenge_reject_below = 0.70         # challenge a reject if confidence < this
+escalate_below_confidence = 0.60      # escalate to human if all rounds < this
+
+[review.challenge]
+max_rounds_low = 1                    # max review rounds for low-risk diffs
+max_rounds_medium = 2
+max_rounds_high = 2
+max_rounds_critical = 3               # critical diffs get up to 3 rounds
+
+[review.escalation]
+on_reviewer_disagreement = true       # escalate if reviewer still disagrees after challenge
+on_all_rounds_below_confidence = 0.60
+on_critical_below_confidence = 0.80
+on_security_path_below_confidence = 0.85
+max_rejection_loops = 3               # escalate after N consecutive rejections
+
+[review.risk]
+# Extend the built-in security/high-risk path patterns.
+# Prefix with ! to remove a built-in pattern.
+security_paths = []                   # e.g. ["*/vault/*", "!*/auth/*"]
+high_risk_paths = []                  # e.g. ["*/custom_infra/*"]
+
+# --- Self-healing diagnostic sessions ---
+
+[self_healing]
+enabled = true                        # launch a diagnosis session on recoverable failures
+diagnosis_provider = "claude"         # provider for the diagnosis role
+diagnosis_model = "opus"   # model for diagnosis (changeable)
+diagnosis_cli_path = "claude"         # CLI binary for diagnosis
+max_diagnosis_per_task = 1            # max diagnosis attempts per failed task
+max_auto_fix_actions_per_task = 2     # max auto-fix actions before escalating
+diagnosis_timeout_seconds = 120       # timeout for each diagnosis call

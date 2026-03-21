@@ -1,4 +1,4 @@
-"""Read-only review bundle assembly for evaluator invocations."""
+"""Read-only review bundle assembly for reviewer invocations."""
 
 from __future__ import annotations
 
@@ -22,7 +22,7 @@ class ReviewBundle(BaseModel):
 
     def to_prompt(self) -> str:
         sections = [
-            "# Ralph Evaluator Review Bundle",
+            "# Ralph Review Bundle",
             "",
             "## Task Contract",
             f"- ID: {self.task.id}",
@@ -67,7 +67,7 @@ class ReviewBundle(BaseModel):
 
 
 class ReviewBundleBuilder:
-    """Build a read-only bundle for evaluator review."""
+    """Build a read-only bundle for reviewer review."""
 
     def __init__(self, repo_root: str | Path) -> None:
         self.repo_root = Path(repo_root)

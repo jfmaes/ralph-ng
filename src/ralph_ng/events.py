@@ -57,3 +57,22 @@ class EventLogger:
                 except (json.JSONDecodeError, ValidationError):
                     continue
         return records
+
+    def read_events_tail(self, n: int) -> list[EventRecord]:
+        """Read the last *n* events efficiently by reading from the end."""
+        if not self.path.exists():
+            return []
+        lines: list[str] = []
+        with self.path.open("r", encoding="utf-8") as handle:
+            for line in handle:
+                lines.append(line)
+                if len(lines) > n:
+                    lines.pop(0)
+        records: list[EventRecord] = []
+        for line in lines:
+            try:
+                payload = json.loads(line)
+                records.append(EventRecord.model_validate(payload))
+            except (json.JSONDecodeError, ValidationError):
+                continue
+        return records
