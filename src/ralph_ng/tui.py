@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import threading
+import time
 from typing import Callable
 
 from rich.text import Text
@@ -21,6 +22,7 @@ from .state import StateStore
 
 
 TERMINAL_STATES = {"completed", "blocked_human", "blocked_system", "failed_exhausted", "paused"}
+RUN_HEARTBEAT_SECONDS = 5.0
 
 
 class RalphDashboardApp(App[None]):
@@ -142,6 +144,7 @@ class RalphDashboardApp(App[None]):
         self.outcome_holder: dict[str, object] = {}
         self.error_holder: dict[str, BaseException] = {}
         self.worker: threading.Thread | None = None
+        self.last_heartbeat = time.monotonic()
         self._activity_context: tuple[str, int] | None = None
         self._executor_seen = 0
         self._reviewer_seen = 0
@@ -267,6 +270,16 @@ class RalphDashboardApp(App[None]):
 
         self._sync_activity_logs(current_task)
         self._sync_event_log(run_events)
+
+        # Heartbeat — keep the controller alive in the database
+        if self.worker is not None and self.worker.is_alive():
+            now = time.monotonic()
+            if now - self.last_heartbeat >= RUN_HEARTBEAT_SECONDS:
+                try:
+                    self.store.touch_run(self.run_id)
+                except KeyError:
+                    pass
+                self.last_heartbeat = now
 
         if self.error_holder and self.worker is not None and not self.worker.is_alive():
             self.exit()
