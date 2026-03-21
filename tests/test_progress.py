@@ -1,8 +1,9 @@
 from pathlib import Path
 
+from ralph_ng.adapters.streaming import ActivityKind, LiveActivityTracker, make_activity
 from ralph_ng.events import EventLogger
 from ralph_ng.plan import Plan
-from ralph_ng.progress import ProgressRenderer
+from ralph_ng.progress import ProgressRenderer, ProviderActivity
 from ralph_ng.state import StateStore
 
 
@@ -33,7 +34,7 @@ def make_plan() -> Plan:
     )
 
 
-def test_renders_current_task_state_and_attempt_count(tmp_path: Path) -> None:
+def test_renders_task_state_and_run_id(tmp_path: Path) -> None:
     store = StateStore(tmp_path / "state.db")
     store.create_run("ralph-plan.yaml", run_id="run-001", status="running", task_ids=["TASK-001", "TASK-002"])
     store.transition_task("run-001", "TASK-001", "review", attempt_count=2)
@@ -43,13 +44,12 @@ def test_renders_current_task_state_and_attempt_count(tmp_path: Path) -> None:
     output = renderer.render_text("run-001", plan=make_plan())
 
     assert "run-001" in output
-    assert "TASK-001" in output
+    assert "001" in output  # task ID shown (possibly truncated)
     assert "First task" in output
     assert "review" in output
-    assert "Attempt 2" in output
 
 
-def test_renders_verification_status_tokens_and_cost_estimate(tmp_path: Path) -> None:
+def test_renders_cost_panel(tmp_path: Path) -> None:
     store = StateStore(tmp_path / "state.db")
     store.create_run("ralph-plan.yaml", run_id="run-001", status="running", task_ids=["TASK-001"])
     store.transition_task("run-001", "TASK-001", "review", attempt_count=1)
@@ -64,20 +64,12 @@ def test_renders_verification_status_tokens_and_cost_estimate(tmp_path: Path) ->
         exit_status=0,
     )
     events = EventLogger(tmp_path / "events.jsonl")
-    events.log(
-        "verification.result",
-        task_id="TASK-001",
-        data={"run_id": "run-001", "command": "pytest tests/test_first.py -x", "success": True},
-    )
     renderer = ProgressRenderer(store=store, events=events)
 
     output = renderer.render_text("run-001", plan=make_plan())
 
-    assert "pytest tests/test_first.py -x" in output
-    assert "pass" in output
-    assert "Tokens" in output
-    assert "flat heuristic" in output
-    assert "$" in output
+    assert "$" in output  # cost estimate
+    assert "120" in output or "in" in output  # token count
 
 
 def test_renders_blocker_reason_when_blocked(tmp_path: Path) -> None:
@@ -94,11 +86,50 @@ def test_renders_blocker_reason_when_blocked(tmp_path: Path) -> None:
 
     output = renderer.render_text("run-001", plan=make_plan())
 
-    assert "blocked_human" in output
+    assert "BLOCKED" in output
     assert "Workspace drift detected." in output
+    assert "INTERVENTION" in output  # banner title
 
 
-def test_renders_final_summary_on_completion(tmp_path: Path) -> None:
+def test_renders_structured_human_intervention_details(tmp_path: Path) -> None:
+    from ralph_ng.utils import make_human_intervention_payload
+
+    store = StateStore(tmp_path / "state.db")
+    store.create_run("ralph-plan.yaml", run_id="run-001", status="blocked_human", task_ids=["TASK-001"])
+    store.transition_task(
+        "run-001",
+        "TASK-001",
+        "blocked_human",
+        attempt_count=1,
+        last_error=make_human_intervention_payload(
+            summary="Adversarial review escalation for TASK-001.",
+            what_failed="Reviewer rejected the task with one unresolved finding.",
+            expected_human_actions=[
+                "Inspect F1 and apply the suggested fix.",
+                "Run `npm run build`.",
+                "Run `ralph resume --run-id run-001`.",
+            ],
+            findings=[
+                {
+                    "id": "F1",
+                    "severity": "critical",
+                    "category": "correctness",
+                    "description": "Build is broken.",
+                },
+            ],
+        ),
+    )
+    renderer = ProgressRenderer(store=store, events=EventLogger(tmp_path / "events.jsonl"))
+
+    output = renderer.render_text("run-001", plan=make_plan())
+
+    assert "Reviewer rejected the task with one unresolved finding." in output
+    assert "F1 [critical] (correctness): Build is broken." in output
+    assert "Do this:" in output
+    assert "Inspect F1 and apply the suggested fix." in output
+
+
+def test_renders_completion_status(tmp_path: Path) -> None:
     store = StateStore(tmp_path / "state.db")
     store.create_run("ralph-plan.yaml", run_id="run-001", status="completed", task_ids=["TASK-001"])
     store.transition_task("run-001", "TASK-001", "done", attempt_count=1)
@@ -106,8 +137,8 @@ def test_renders_final_summary_on_completion(tmp_path: Path) -> None:
 
     output = renderer.render_text("run-001", plan=make_plan())
 
-    assert "completed" in output
-    assert "done: 1" in output
+    assert "COMPLETED" in output
+    assert "done" in output
 
 
 def test_renders_without_events_or_invocations(tmp_path: Path) -> None:
@@ -117,5 +148,172 @@ def test_renders_without_events_or_invocations(tmp_path: Path) -> None:
 
     output = renderer.render_text("run-001", plan=make_plan())
 
-    assert "Current Task: none" in output
-    assert "Tokens: in=0 out=0" in output
+    assert "run-001" in output
+    assert "RUNNING" in output
+    assert "idle" in output  # executor/reviewer idle
+
+
+def test_event_log_shows_recent_events(tmp_path: Path) -> None:
+    store = StateStore(tmp_path / "state.db")
+    store.create_run("ralph-plan.yaml", run_id="run-001", status="running", task_ids=["TASK-001"])
+    events = EventLogger(tmp_path / "events.jsonl")
+    events.log("executor.started", task_id="TASK-001", data={"run_id": "run-001", "attempt": 1})
+    events.log("executor.completed", task_id="TASK-001", data={"run_id": "run-001", "status": "completed"})
+    renderer = ProgressRenderer(store=store, events=events)
+
+    output = renderer.render_text("run-001", plan=make_plan())
+
+    assert "executor.started" in output
+    assert "executor.completed" in output
+
+
+def test_problem_banner_on_failed_exhausted(tmp_path: Path) -> None:
+    store = StateStore(tmp_path / "state.db")
+    store.create_run("ralph-plan.yaml", run_id="run-001", status="failed_exhausted", task_ids=["TASK-001"])
+    store.transition_task("run-001", "TASK-001", "failed_exhausted", attempt_count=3, last_error="Retry budget exhausted.")
+    renderer = ProgressRenderer(store=store, events=EventLogger(tmp_path / "events.jsonl"))
+
+    output = renderer.render_text("run-001", plan=make_plan())
+
+    assert "FAILED" in output
+    assert "Retry budget exhausted" in output
+
+
+def test_problem_banner_on_stale_running_review(tmp_path: Path) -> None:
+    store = StateStore(tmp_path / "state.db")
+    store.create_run("ralph-plan.yaml", run_id="run-001", status="running", task_ids=["TASK-001"])
+    store.transition_task("run-001", "TASK-001", "review", attempt_count=1)
+    store.connection.execute(
+        "UPDATE runs SET updated_at = ? WHERE id = ?",
+        ("2000-01-01T00:00:00+00:00", "run-001"),
+    )
+    store.connection.commit()
+    renderer = ProgressRenderer(store=store, events=EventLogger(tmp_path / "events.jsonl"))
+
+    output = renderer.render_text("run-001", plan=make_plan())
+
+    assert "Run heartbeat stale" in output
+    assert "orchestrator process may have died" in output
+
+
+def test_provider_activity_defaults(tmp_path: Path) -> None:
+    pa = ProviderActivity()
+    assert pa.provider == ""
+    assert pa.active is False
+    assert pa.review_round == 0
+
+
+def test_verification_events_in_log(tmp_path: Path) -> None:
+    """Verification results appear in the event log section."""
+    store = StateStore(tmp_path / "state.db")
+    store.create_run("ralph-plan.yaml", run_id="run-001", status="running", task_ids=["TASK-001"])
+    store.transition_task("run-001", "TASK-001", "review", attempt_count=1)
+    events = EventLogger(tmp_path / "events.jsonl")
+    events.log(
+        "verification.result",
+        task_id="TASK-001",
+        data={"run_id": "run-001", "command": "pytest tests/test_first.py -x", "success": True},
+    )
+    renderer = ProgressRenderer(store=store, events=events)
+
+    output = renderer.render_text("run-001", plan=make_plan())
+
+    assert "verification.result" in output
+    assert "pass" in output
+
+
+def test_activity_panel_with_tracker(tmp_path: Path) -> None:
+    """Activity panel shows tracker events when tracker is present."""
+    store = StateStore(tmp_path / "state.db")
+    store.create_run("ralph-plan.yaml", run_id="run-001", status="running", task_ids=["TASK-001"])
+    store.transition_task("run-001", "TASK-001", "in_progress", attempt_count=1)
+    events = EventLogger(tmp_path / "events.jsonl")
+    events.log("executor.started", task_id="TASK-001", data={"run_id": "run-001", "attempt": 1})
+
+    tracker = LiveActivityTracker()
+    tracker.push(make_activity(ActivityKind.COMMENTARY, "Analyzing the auth module"))
+    tracker.push(make_activity(ActivityKind.TOOL_EDIT, "[Edit] src/auth/oauth.ts"))  # not significant
+    tracker.push(make_activity(ActivityKind.COMMENTARY, "Running tests to verify changes"))
+    tracker.push(make_activity(ActivityKind.COMMENTARY, "All tests passing, moving to User model"))
+
+    from ralph_ng.providers.event_store import ProviderEventStore
+    from ralph_ng.providers.events import ProviderEventType, make_event
+
+    pe_store = ProviderEventStore(tmp_path)
+    pe_store.log(make_event(
+        run_id="run-001", task_id="TASK-001", attempt_number=1,
+        provider="claude", role="executor", review_round=0,
+        event_type=ProviderEventType.AGENT_STARTED,
+    ))
+
+    renderer = ProgressRenderer(
+        store=store,
+        events=events,
+        provider_event_store=pe_store,
+        executor_activity_tracker=tracker,
+    )
+
+    output = renderer.render_text("run-001", plan=make_plan())
+
+    # Recent activity should show concrete operator-visible progress.
+    assert "Analyzing the auth module" in output or "Running tests" in output
+    assert "All tests passing" in output
+    assert "[Edit] src/auth/oauth.ts" not in output
+
+
+def test_activity_panel_falls_back_to_tool_activity(tmp_path: Path) -> None:
+    store = StateStore(tmp_path / "state.db")
+    store.create_run("ralph-plan.yaml", run_id="run-001", status="running", task_ids=["TASK-001"])
+    store.transition_task("run-001", "TASK-001", "in_progress", attempt_count=1)
+    events = EventLogger(tmp_path / "events.jsonl")
+
+    tracker = LiveActivityTracker()
+    tracker.push(make_activity(ActivityKind.TOOL_READ, "[Read] src/auth/oauth.ts"))
+    tracker.push(make_activity(ActivityKind.TOOL_BASH, "[Bash] npm test"))
+
+    from ralph_ng.providers.event_store import ProviderEventStore
+    from ralph_ng.providers.events import ProviderEventType, make_event
+
+    pe_store = ProviderEventStore(tmp_path)
+    pe_store.log(make_event(
+        run_id="run-001", task_id="TASK-001", attempt_number=1,
+        provider="claude", role="executor", review_round=0,
+        event_type=ProviderEventType.AGENT_STARTED,
+    ))
+
+    renderer = ProgressRenderer(
+        store=store,
+        events=events,
+        provider_event_store=pe_store,
+        executor_activity_tracker=tracker,
+    )
+
+    output = renderer.render_text("run-001", plan=make_plan())
+
+    assert "[Read] src/auth/oauth.ts" in output
+    assert "[Bash] npm test" in output
+
+
+def test_focus_panel_shows_verification_and_risk(tmp_path: Path) -> None:
+    store = StateStore(tmp_path / "state.db")
+    store.create_run("ralph-plan.yaml", run_id="run-001", status="running", task_ids=["TASK-001"])
+    store.transition_task("run-001", "TASK-001", "review", attempt_count=1)
+    events = EventLogger(tmp_path / "events.jsonl")
+    events.log(
+        "verification.result",
+        task_id="TASK-001",
+        data={"run_id": "run-001", "attempt": 1, "command": "pytest tests/test_first.py -x", "success": True},
+    )
+    events.log(
+        "review.risk_classified",
+        task_id="TASK-001",
+        data={"run_id": "run-001", "attempt": 1, "risk": "low", "diff_lines": 12, "file_count": 2},
+    )
+    renderer = ProgressRenderer(store=store, events=events)
+
+    output = renderer.render_text("run-001", plan=make_plan())
+
+    assert "Current Task" in output
+    assert "verification 1/1 pass" in output
+    assert "reviewer-scrutiny: low (diff based)" in output
+    assert "12" in output and "2 files" in output

@@ -1,18 +1,21 @@
 from __future__ import annotations
 
+import re
 from pathlib import Path
 import shutil
 import subprocess
 
 from typer.testing import CliRunner
 
-from ralph_ng.adapters.base import (
-    EvaluatorResult,
-    EvaluatorVerdict,
-    ExecutorResult,
-    InvocationStatus,
-)
+from ralph_ng.adapters.base import ExecutorResult, InvocationStatus
 from ralph_ng.cli import app
+from ralph_ng.review_findings import (
+    FindingCategory,
+    FindingSeverity,
+    ReviewFinding,
+    ReviewFindings,
+    ReviewResult,
+)
 
 
 runner = CliRunner()
@@ -54,33 +57,49 @@ class FakeExecutor:
         )
 
 
-class FakeEvaluator:
+class FakeReviewer:
     def __init__(self) -> None:
         self.call_counts: dict[str, int] = {}
 
-    def evaluate(self, review_bundle, *, timeout_seconds: int | float, cwd: str | Path | None = None) -> EvaluatorResult:
-        task_id = review_bundle.task.id
+    def review(self, prompt: str, *, timeout_seconds: int | float, cwd: str | None = None) -> ReviewResult:
+        match = re.search(r"TASK-\d+", prompt)
+        task_id = match.group(0) if match else "TASK-001"
         attempt_number = self.call_counts.get(task_id, 0) + 1
         self.call_counts[task_id] = attempt_number
 
         if task_id == "TASK-002" and attempt_number == 1:
-            verdict = EvaluatorVerdict(
+            findings = ReviewFindings(
                 decision="reject",
+                confidence=0.92,
+                spec_compliance="fail",
                 summary="Missing retry marker coverage.",
+                findings=[
+                    ReviewFinding(
+                        id="F1",
+                        severity=FindingSeverity.IMPORTANT,
+                        category=FindingCategory.CORRECTNESS,
+                        description="Add retry-marker to work.txt for TASK-002.",
+                        evidence="work.txt missing retry-marker",
+                    ),
+                ],
                 repair_notes="Add retry-marker to work.txt for TASK-002.",
                 new_verification_commands=["grep -q 'retry-marker' work.txt"],
             )
         else:
-            verdict = EvaluatorVerdict(decision="accept", summary="Looks good")
+            findings = ReviewFindings(
+                decision="accept",
+                confidence=0.95,
+                spec_compliance="pass",
+                summary="Looks good",
+                findings=[],
+            )
 
-        return EvaluatorResult(
+        return ReviewResult(
             status=InvocationStatus.COMPLETED,
-            output_text=verdict.summary,
+            findings=findings,
             input_tokens=5,
             output_tokens=5,
             duration_seconds=0.01,
-            exit_status=0,
-            verdict=verdict,
         )
 
 
@@ -104,8 +123,8 @@ def test_full_lifecycle_validate_start_complete_with_one_retry(tmp_path: Path, m
     repo = setup_repo(tmp_path)
     monkeypatch.chdir(repo)
     monkeypatch.setattr("ralph_ng.cli.generate_run_id", lambda: "run-e2e")
-    monkeypatch.setattr("ralph_ng.cli.build_executor_adapter", lambda config: FakeExecutor(repo))
-    monkeypatch.setattr("ralph_ng.cli.build_evaluator_adapter", lambda config: FakeEvaluator())
+    monkeypatch.setattr("ralph_ng.cli.build_executor", lambda config, **kw: FakeExecutor(repo))
+    monkeypatch.setattr("ralph_ng.cli.build_reviewer", lambda config, **kw: FakeReviewer())
 
     validated = runner.invoke(app, ["validate-plan", "--plan", "ralph-plan.yaml", "--base-dir", "."])
     started = runner.invoke(app, ["start"])
@@ -115,7 +134,7 @@ def test_full_lifecycle_validate_start_complete_with_one_retry(tmp_path: Path, m
     assert started.exit_code == 0
     assert status.exit_code == 0
     assert "completed" in started.stdout
-    assert "completed" in status.stdout
+    assert "COMPLETED" in status.stdout
     final_text = (repo / "work.txt").read_text(encoding="utf-8")
     assert "TASK-001" in final_text
     assert "TASK-002" in final_text

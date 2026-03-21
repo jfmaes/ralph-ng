@@ -5,6 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 import re
 import shlex
+import shutil
 import subprocess
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -15,6 +16,20 @@ DANGEROUS_COMMAND_PATTERNS = [
     re.compile(r"\b(?:curl|wget)\b.*\|\s*(?:bash|sh|zsh)\b", re.IGNORECASE),
     re.compile(r"\brm\s+-rf\s+/", re.IGNORECASE),
 ]
+
+ENVIRONMENT_PROBE_PATTERNS = [
+    re.compile(r"^\s*command\s+-v\s+\S+\s*$", re.IGNORECASE),
+    re.compile(r"^\s*which\s+\S+\s*$", re.IGNORECASE),
+    re.compile(r"^\s*type\s+\S+\s*$", re.IGNORECASE),
+]
+
+PORTABLE_ALTERNATIVES: dict[str, str] = {
+    "rg": "grep -rnE",
+    "fd": "find . -name",
+    "bat": "cat",
+    "exa": "ls",
+    "delta": "diff",
+}
 
 
 class RejectedCheck(BaseModel):
@@ -39,7 +54,7 @@ class RatchetOverlay(BaseModel):
 
 
 class RatchetManager:
-    """Validate and persist evaluator-added verification commands."""
+    """Validate and persist reviewer-added verification commands."""
 
     def __init__(
         self,
@@ -61,8 +76,17 @@ class RatchetManager:
         overlay = self.load_overlay(task_id)
         accepted: list[str] = []
         rejected: list[RejectedCheck] = []
+        seen = set(overlay.verification_commands)
 
         for command in commands:
+            if command in seen:
+                rejected.append(
+                    RejectedCheck(
+                        command=command,
+                        reason="duplicate verification command",
+                    )
+                )
+                continue
             if len(overlay.verification_commands) + len(accepted) >= self.max_checks_per_task:
                 rejected.append(
                     RejectedCheck(
@@ -75,6 +99,7 @@ class RatchetManager:
             reason = self._validate_command(command)
             if reason is None:
                 accepted.append(command)
+                seen.add(command)
             else:
                 rejected.append(RejectedCheck(command=command, reason=reason))
 
@@ -125,6 +150,14 @@ class RatchetManager:
         stderr = completed.stderr.lower()
         stdout = completed.stdout.lower()
         if self._looks_like_missing_binary(command, completed.returncode, completed.stderr):
+            # Suggest a portable alternative if available
+            try:
+                executable = shlex.split(command)[0]
+            except (ValueError, IndexError):
+                executable = ""
+            alt = PORTABLE_ALTERNATIVES.get(executable)
+            if alt and not shutil.which(executable):
+                return f"missing binary '{executable}' — portable alternative: {alt}"
             return "missing binary or command not found"
         if "syntax error" in stderr or "syntaxerror" in stderr or "syntax error" in stdout:
             return "syntax error detected during ratchet validation"
@@ -136,6 +169,9 @@ class RatchetManager:
         for pattern in DANGEROUS_COMMAND_PATTERNS:
             if pattern.search(command):
                 return "command uses a blocked dangerous shell pattern"
+        for pattern in ENVIRONMENT_PROBE_PATTERNS:
+            if pattern.match(command):
+                return "environment probe commands are not allowed as persistent verification checks"
         return None
 
     def _looks_like_missing_binary(self, command: str, returncode: int, stderr: str) -> bool:

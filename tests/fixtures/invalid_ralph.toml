@@ -1,6 +1,5 @@
 [models]
 executor = ""
-evaluator = "opus"
 cli = "claude"
 
 [timeouts]

@@ -143,6 +143,24 @@ def test_detects_workspace_drift_against_snapshot(tmp_path: Path) -> None:
     assert manager.detect_drift(patch_path) is True
 
 
+def test_reset_to_head_clean_discards_dirty_state(tmp_path: Path) -> None:
+    repo = init_repo(tmp_path)
+    manager = GitManager(
+        repo_root=repo,
+        branch_prefix="ralph/",
+        protected_branches=["main", "master"],
+        force_push=False,
+    )
+    (repo / "app.py").write_text("VALUE = 2\n", encoding="utf-8")
+    (repo / "scratch.txt").write_text("temp\n", encoding="utf-8")
+
+    manager.reset_to_head_clean()
+
+    assert manager.is_clean() is True
+    assert (repo / "scratch.txt").exists() is False
+    assert (repo / "app.py").read_text(encoding="utf-8") == "VALUE = 1\n"
+
+
 def test_pushes_to_remote_when_enabled(tmp_path: Path) -> None:
     repo = init_repo(tmp_path)
     remote = tmp_path / "remote.git"

@@ -41,6 +41,9 @@ class GitManager:
     def current_branch(self) -> str:
         return self._run_git("rev-parse", "--abbrev-ref", "HEAD")
 
+    def current_commit(self) -> str:
+        return self._run_git("rev-parse", "HEAD")
+
     def git_dir(self) -> Path:
         return self.repo_root / self._run_git("rev-parse", "--git-dir")
 
@@ -65,6 +68,22 @@ class GitManager:
             return True
 
         return self._build_patch_snapshot() != path.read_text(encoding="utf-8")
+
+    def reset_to_head_clean(self) -> None:
+        """Discard uncommitted changes and untracked files, returning to HEAD."""
+        self._run_git("reset", "--hard", "HEAD")
+        completed = subprocess.run(
+            ["git", "clean", "-fd"],
+            cwd=self.repo_root,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if completed.returncode != 0:
+            raise GitError(
+                f"git clean -fd failed with exit code {completed.returncode}: "
+                f"{completed.stderr.strip() or completed.stdout.strip()}"
+            )
 
     def commit_task(self, task_id: str, title: str) -> str:
         self._run_git("add", "-A")

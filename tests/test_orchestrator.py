@@ -1,26 +1,23 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 import re
 import subprocess
 import sys
 
-from ralph_ng.adapters.base import (
-    EvaluatorResult,
-    EvaluatorVerdict,
-    ExecutorResult,
-    InvocationStatus,
-)
-from ralph_ng.config import RalphConfig
+from ralph_ng.adapters.base import ExecutorResult, InvocationStatus
+from ralph_ng.config import RalphConfig, RolesConfig, RoleConfig
 from ralph_ng.events import EventLogger
 from ralph_ng.git_manager import GitManager
 from ralph_ng.orchestrator import Orchestrator, RunStatus
 from ralph_ng.plan import Plan
 from ralph_ng.prompt_builder import PromptBuilder
-from ralph_ng.review_bundle import ReviewBundle
 from ralph_ng.review_bundle import ReviewBundleBuilder
+from ralph_ng.review_findings import ReviewResult, ReviewFindings, ReviewFinding, FindingSeverity, FindingCategory
 from ralph_ng.state import StateStore
 from ralph_ng.verification import VerificationRunner
+from ralph_ng.utils import parse_human_intervention_payload
 
 
 def git(repo: Path, *args: str) -> str:
@@ -92,23 +89,25 @@ class FakeExecutor:
         return behavior(self.repo_root, attempt_number)
 
 
-class FakeEvaluator:
+class FakeReviewer:
     def __init__(self, verdicts: dict[str, list[callable]]) -> None:
         self.verdicts = verdicts
         self.call_counts: dict[str, int] = {}
 
-    def evaluate(
+    def review(
         self,
-        review_bundle: ReviewBundle,
+        prompt: str,
         *,
         timeout_seconds: int | float,
-        cwd: str | Path | None = None,
-    ) -> EvaluatorResult:
-        task_id = review_bundle.task.id
+        cwd: str | None = None,
+    ) -> ReviewResult:
+        # Extract task ID from prompt
+        match = re.search(r"TASK-\d+", prompt)
+        task_id = match.group(0) if match else "TASK-001"
         attempt_number = self.call_counts.get(task_id, 0) + 1
         self.call_counts[task_id] = attempt_number
         behavior = self.verdicts[task_id][attempt_number - 1]
-        return behavior(review_bundle, attempt_number)
+        return behavior(attempt_number)
 
 
 class DriftAfterFirstCommitGitManager(GitManager):
@@ -128,23 +127,20 @@ def make_orchestrator(
     tmp_path: Path,
     plan: Plan,
     executor: FakeExecutor,
-    evaluator: FakeEvaluator,
+    reviewer: FakeReviewer,
     *,
     git_manager: GitManager | None = None,
     max_retries: int = 3,
 ) -> tuple[Path, StateStore, EventLogger, Orchestrator]:
     repo = executor.repo_root
     state_root = tmp_path / "state-root"
-    config = RalphConfig.model_validate(
-        {
-            "ralph": {
-                "branch_prefix": "ralph/",
-                "auto_push": False,
-                "max_retries_per_task": max_retries,
-                "max_ratchet_checks_per_task": 10,
-            }
-        }
+    config = RalphConfig(
+        roles=RolesConfig(
+            executor=RoleConfig(provider="claude", model="sonnet"),
+            reviewer=RoleConfig(provider="codex", model="gpt-5.3-codex", cli_path="codex"),
+        ),
     )
+    config.ralph.max_retries_per_task = max_retries
     store = StateStore(state_root / "state.db")
     events = EventLogger(state_root / "events.jsonl")
     orchestrator = Orchestrator(
@@ -164,7 +160,7 @@ def make_orchestrator(
         ),
         prompt_builder=PromptBuilder(repo_root=repo, spec_paths=[]),
         executor=executor,
-        evaluator=evaluator,
+        reviewer=reviewer,
         verification_runner=VerificationRunner(timeout_seconds=5, cwd=repo),
         review_bundle_builder=ReviewBundleBuilder(repo_root=repo),
     )
@@ -187,6 +183,17 @@ def executor_write_marker(task_id: str) -> callable:
     return _behavior
 
 
+def executor_noop(repo_root: Path, attempt_number: int) -> ExecutorResult:
+    return ExecutorResult(
+        status=InvocationStatus.COMPLETED,
+        output_text="noop",
+        input_tokens=1,
+        output_tokens=1,
+        duration_seconds=0.01,
+        exit_status=0,
+    )
+
+
 def executor_retry_marker(repo_root: Path, attempt_number: int) -> ExecutorResult:
     with (repo_root / "work.txt").open("a", encoding="utf-8") as handle:
         handle.write("TASK-001\n")
@@ -203,40 +210,51 @@ def executor_retry_marker(repo_root: Path, attempt_number: int) -> ExecutorResul
 
 
 def accept_verdict(summary: str = "ok") -> callable:
-    def _behavior(review_bundle: ReviewBundle, attempt_number: int) -> EvaluatorResult:
-        return EvaluatorResult(
+    def _behavior(attempt_number: int) -> ReviewResult:
+        return ReviewResult(
             status=InvocationStatus.COMPLETED,
-            output_text=summary,
+            findings=ReviewFindings(
+                decision="accept",
+                confidence=0.95,
+                spec_compliance="pass",
+                summary=summary,
+                findings=[],
+            ),
             input_tokens=7,
             output_tokens=4,
             duration_seconds=0.01,
-            exit_status=0,
-            verdict=EvaluatorVerdict(decision="accept", summary=summary),
         )
-
     return _behavior
 
 
 def reject_with_overlay(summary: str = "needs more work") -> callable:
-    def _behavior(review_bundle: ReviewBundle, attempt_number: int) -> EvaluatorResult:
-        return EvaluatorResult(
+    def _behavior(attempt_number: int) -> ReviewResult:
+        return ReviewResult(
             status=InvocationStatus.COMPLETED,
-            output_text=summary,
-            input_tokens=7,
-            output_tokens=4,
-            duration_seconds=0.01,
-            exit_status=0,
-            verdict=EvaluatorVerdict(
+            findings=ReviewFindings(
                 decision="reject",
+                confidence=0.92,
+                spec_compliance="fail",
                 summary=summary,
+                findings=[
+                    ReviewFinding(
+                        id="F1",
+                        severity=FindingSeverity.IMPORTANT,
+                        category=FindingCategory.CORRECTNESS,
+                        description="Add the retry marker.",
+                        evidence="work.txt missing retry-marker",
+                    ),
+                ],
                 repair_notes="Add the retry marker.",
                 new_verification_commands=[
                     f"{sys.executable} -c \"from pathlib import Path; "
                     "text=Path('work.txt').read_text(); assert 'retry-marker' in text\""
                 ],
             ),
+            input_tokens=7,
+            output_tokens=4,
+            duration_seconds=0.01,
         )
-
     return _behavior
 
 
@@ -254,14 +272,14 @@ def test_happy_path_executes_three_task_plan_to_completion(tmp_path: Path) -> No
             "TASK-003": [executor_write_marker("TASK-003")],
         },
     )
-    evaluator = FakeEvaluator(
+    reviewer = FakeReviewer(
         {
             "TASK-001": [accept_verdict()],
             "TASK-002": [accept_verdict()],
             "TASK-003": [accept_verdict()],
         }
     )
-    _, store, events, orchestrator = make_orchestrator(tmp_path, plan, executor, evaluator)
+    _, store, events, orchestrator = make_orchestrator(tmp_path, plan, executor, reviewer)
 
     outcome = orchestrator.start(run_id="run-001")
 
@@ -276,8 +294,8 @@ def test_retry_flow_rejects_once_then_accepts(tmp_path: Path) -> None:
     repo = init_repo(tmp_path)
     plan = make_plan(1)
     executor = FakeExecutor(repo, {"TASK-001": [executor_retry_marker, executor_retry_marker]})
-    evaluator = FakeEvaluator({"TASK-001": [reject_with_overlay(), accept_verdict("fixed")]})
-    _, store, _, orchestrator = make_orchestrator(tmp_path, plan, executor, evaluator)
+    reviewer = FakeReviewer({"TASK-001": [reject_with_overlay(), accept_verdict("fixed")]})
+    _, store, _, orchestrator = make_orchestrator(tmp_path, plan, executor, reviewer)
 
     outcome = orchestrator.start(run_id="run-001")
 
@@ -288,6 +306,26 @@ def test_retry_flow_rejects_once_then_accepts(tmp_path: Path) -> None:
     assert "retry-marker" in (repo / "work.txt").read_text(encoding="utf-8")
 
 
+def test_accepts_clean_tree_without_creating_new_commit(tmp_path: Path) -> None:
+    repo = init_repo(tmp_path)
+    # Make base repo already satisfy the task verification.
+    (repo / "work.txt").write_text("base\nTASK-001\n", encoding="utf-8")
+    git(repo, "add", "work.txt")
+    git(repo, "commit", "-m", "Pre-existing task result")
+
+    plan = make_plan(1)
+    executor = FakeExecutor(repo, {"TASK-001": [executor_noop]})
+    reviewer = FakeReviewer({"TASK-001": [accept_verdict("already satisfied")]})
+    _, store, events, orchestrator = make_orchestrator(tmp_path, plan, executor, reviewer)
+
+    outcome = orchestrator.start(run_id="run-001")
+
+    assert outcome.status is RunStatus.COMPLETED
+    assert store.get_task_state("run-001", "TASK-001").state == "done"
+    accepted = [event for event in events.read_events() if event.event_type == "task.accepted"]
+    assert accepted
+
+
 def test_failed_exhausted_after_retry_budget(tmp_path: Path) -> None:
     repo = init_repo(tmp_path)
     plan = make_plan(1)
@@ -295,21 +333,21 @@ def test_failed_exhausted_after_retry_budget(tmp_path: Path) -> None:
         repo,
         {"TASK-001": [executor_write_marker("TASK-001")] * 3},
     )
-    evaluator = FakeEvaluator(
+    reviewer = FakeReviewer(
         {"TASK-001": [reject_with_overlay(), reject_with_overlay(), reject_with_overlay()]}
     )
     _, store, _, orchestrator = make_orchestrator(
         tmp_path,
         plan,
         executor,
-        evaluator,
+        reviewer,
         max_retries=3,
     )
 
     outcome = orchestrator.start(run_id="run-001")
 
-    assert outcome.status is RunStatus.FAILED_EXHAUSTED
-    assert store.get_task_state("run-001", "TASK-001").state == "failed_exhausted"
+    assert outcome.status is RunStatus.BLOCKED_HUMAN
+    # With adversarial review, 3 consecutive high-confidence rejections → escalation
 
 
 def test_blocked_system_on_rate_limit_pauses_cleanly(tmp_path: Path) -> None:
@@ -328,8 +366,8 @@ def test_blocked_system_on_rate_limit_pauses_cleanly(tmp_path: Path) -> None:
         )
 
     executor = FakeExecutor(repo, {"TASK-001": [rate_limited]})
-    evaluator = FakeEvaluator({"TASK-001": [accept_verdict()]})
-    _, store, _, orchestrator = make_orchestrator(tmp_path, plan, executor, evaluator)
+    reviewer = FakeReviewer({"TASK-001": [accept_verdict()]})
+    _, store, _, orchestrator = make_orchestrator(tmp_path, plan, executor, reviewer)
 
     outcome = orchestrator.start(run_id="run-001")
 
@@ -347,7 +385,7 @@ def test_blocked_human_on_workspace_drift_pauses_cleanly(tmp_path: Path) -> None
             "TASK-002": [executor_write_marker("TASK-002")],
         },
     )
-    evaluator = FakeEvaluator({"TASK-001": [accept_verdict()], "TASK-002": [accept_verdict()]})
+    reviewer = FakeReviewer({"TASK-001": [accept_verdict()], "TASK-002": [accept_verdict()]})
     drift_git_manager = DriftAfterFirstCommitGitManager(
         repo_root=repo,
         branch_prefix="ralph/",
@@ -358,7 +396,7 @@ def test_blocked_human_on_workspace_drift_pauses_cleanly(tmp_path: Path) -> None
         tmp_path,
         plan,
         executor,
-        evaluator,
+        reviewer,
         git_manager=drift_git_manager,
     )
 
@@ -366,3 +404,6 @@ def test_blocked_human_on_workspace_drift_pauses_cleanly(tmp_path: Path) -> None
 
     assert outcome.status is RunStatus.BLOCKED_HUMAN
     assert store.get_task_state("run-001", "TASK-002").state == "blocked_human"
+    payload = parse_human_intervention_payload(store.get_task_state("run-001", "TASK-002").last_error or "")
+    assert payload is not None
+    assert "working tree is not clean" in payload["what_failed"].lower()

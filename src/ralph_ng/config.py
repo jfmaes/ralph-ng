@@ -5,7 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 import tomllib
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
 
 class ConfigLoadError(ValueError):
@@ -29,13 +29,14 @@ class RalphSection(BaseModel):
 
 
 class ModelsConfig(BaseModel):
+    """Legacy model config — used as fallback when [roles] is absent."""
+
     model_config = ConfigDict(extra="forbid")
 
     executor: str = "sonnet"
-    evaluator: str = "opus"
     cli: str = "claude"
 
-    @field_validator("executor", "evaluator", "cli")
+    @field_validator("executor", "cli")
     @classmethod
     def validate_model_name(cls, value: str) -> str:
         if not value.strip():
@@ -48,7 +49,7 @@ class TimeoutsConfig(BaseModel):
 
     executor_call_seconds: int = Field(default=600, ge=1)
     verification_command_seconds: int = Field(default=120, ge=1)
-    evaluator_call_seconds: int = Field(default=300, ge=1)
+    reviewer_call_seconds: int = Field(default=300, ge=1)
 
 
 class GitConfig(BaseModel):
@@ -74,6 +75,134 @@ class GitConfig(BaseModel):
         return value
 
 
+class RoleConfig(BaseModel):
+    """Per-role (executor/reviewer) adapter configuration."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    provider: str = "claude"
+    transport: str = "cli"  # "cli" now, "api" in v0.3
+    model: str = "sonnet"
+    cli_path: str = "claude"
+    reasoning_effort: str | None = None
+    service_tier: str | None = None
+    # Reserved for v0.3 API transport
+    base_url: str | None = None
+    api_key_env: str | None = None
+
+    @field_validator("provider", "transport", "model", "cli_path")
+    @classmethod
+    def validate_non_empty(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("value must not be empty")
+        return value
+
+    @field_validator("reasoning_effort", "service_tier")
+    @classmethod
+    def validate_optional_non_empty(cls, value: str | None) -> str | None:
+        if value is None:
+            return value
+        if not value.strip():
+            raise ValueError("value must not be empty")
+        return value
+
+    @model_validator(mode="after")
+    def apply_codex_defaults(self) -> RoleConfig:
+        if self.provider == "codex":
+            if self.reasoning_effort is None:
+                self.reasoning_effort = "medium"
+            if self.service_tier is None:
+                self.service_tier = "fast"
+        return self
+
+
+class RolesConfig(BaseModel):
+    """Role-based adapter selection (v0.2+)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    executor: RoleConfig = Field(default_factory=lambda: RoleConfig(
+        provider="claude", model="sonnet", cli_path="claude",
+    ))
+    reviewer: RoleConfig = Field(default_factory=lambda: RoleConfig(
+        provider="codex",
+        model="gpt-5.3-codex",
+        cli_path="codex",
+        reasoning_effort="medium",
+        service_tier="fast",
+    ))
+
+
+class ReviewThresholdsConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    auto_accept_min_confidence: float = Field(default=0.95, ge=0.0, le=1.0)
+    challenge_below_confidence: float = Field(default=0.80, ge=0.0, le=1.0)
+    auto_reject_min_confidence: float = Field(default=0.90, ge=0.0, le=1.0)
+    challenge_reject_below: float = Field(default=0.70, ge=0.0, le=1.0)
+    escalate_below_confidence: float = Field(default=0.60, ge=0.0, le=1.0)
+
+
+class ReviewChallengeConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    max_rounds_low: int = Field(default=1, ge=1)
+    max_rounds_medium: int = Field(default=2, ge=1)
+    max_rounds_high: int = Field(default=2, ge=1)
+    max_rounds_critical: int = Field(default=3, ge=1)
+
+
+class ReviewEscalationConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    on_reviewer_disagreement: bool = True
+    on_all_rounds_below_confidence: float = Field(default=0.60, ge=0.0, le=1.0)
+    on_critical_below_confidence: float = Field(default=0.80, ge=0.0, le=1.0)
+    on_security_path_below_confidence: float = Field(default=0.85, ge=0.0, le=1.0)
+    max_rejection_loops: int = Field(default=3, ge=1)
+
+
+class ReviewRiskConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    security_paths: list[str] = Field(default_factory=list)
+    high_risk_paths: list[str] = Field(default_factory=list)
+
+
+class ReviewConfig(BaseModel):
+    """Adversarial review configuration (v0.2+)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = True
+    stages: list[str] = Field(default_factory=lambda: ["spec_compliance", "code_quality"])
+    thresholds: ReviewThresholdsConfig = Field(default_factory=ReviewThresholdsConfig)
+    challenge: ReviewChallengeConfig = Field(default_factory=ReviewChallengeConfig)
+    escalation: ReviewEscalationConfig = Field(default_factory=ReviewEscalationConfig)
+    risk: ReviewRiskConfig = Field(default_factory=ReviewRiskConfig)
+
+
+class SelfHealingConfig(BaseModel):
+    """Self-healing diagnostic session configuration (Phase 4)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = True
+    diagnosis_provider: str = "claude"
+    diagnosis_model: str = "opus"
+    diagnosis_cli_path: str = "claude"
+    max_diagnosis_per_task: int = Field(default=1, ge=0)
+    max_auto_fix_actions_per_task: int = Field(default=2, ge=0)
+    diagnosis_timeout_seconds: int = Field(default=120, ge=1)
+
+    @field_validator("diagnosis_provider", "diagnosis_model", "diagnosis_cli_path")
+    @classmethod
+    def validate_non_empty(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("value must not be empty")
+        return value
+
+
 class RalphConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -81,6 +210,9 @@ class RalphConfig(BaseModel):
     models: ModelsConfig = Field(default_factory=ModelsConfig)
     timeouts: TimeoutsConfig = Field(default_factory=TimeoutsConfig)
     git: GitConfig = Field(default_factory=GitConfig)
+    roles: RolesConfig | None = None
+    review: ReviewConfig = Field(default_factory=ReviewConfig)
+    self_healing: SelfHealingConfig = Field(default_factory=SelfHealingConfig)
 
 
 def load_config(path: str | Path = "ralph.toml") -> RalphConfig:

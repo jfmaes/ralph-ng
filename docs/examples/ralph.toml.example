@@ -6,14 +6,22 @@ max_ratchet_checks_per_task = 10
 
 [models]
 executor = "sonnet"
-evaluator = "opus"
 cli = "claude"
 
 [timeouts]
 executor_call_seconds = 600
 verification_command_seconds = 120
-evaluator_call_seconds = 300
+reviewer_call_seconds = 300
 
 [git]
 protected_branches = ["main", "master"]
 force_push = false
+
+[self_healing]
+enabled = true
+diagnosis_provider = "claude"
+diagnosis_model = "opus"
+diagnosis_cli_path = "claude"
+max_diagnosis_per_task = 1
+max_auto_fix_actions_per_task = 2
+diagnosis_timeout_seconds = 120
