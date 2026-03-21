@@ -38,8 +38,9 @@ class RalphDashboardApp(App[None]):
         padding: 0 1;
     }
 
-    #main {
-        height: 1fr;
+    #overview {
+        height: auto;
+        max-height: 50%;
     }
 
     #left-column {
@@ -61,14 +62,16 @@ class RalphDashboardApp(App[None]):
     #tasks,
     #current-task,
     #cost,
-    #events-title,
-    #executor-title,
-    #reviewer-title {
+    #events-title {
         height: auto;
     }
 
+    .reasoning-title {
+        height: auto;
+        padding: 0 1;
+    }
+
     RichLog {
-        border: round $panel;
         background: $surface;
         scrollbar-size-vertical: 1;
     }
@@ -76,12 +79,18 @@ class RalphDashboardApp(App[None]):
     #executor-log,
     #reviewer-log {
         height: 1fr;
-        min-height: 8;
-        margin-bottom: 1;
+        min-height: 6;
+        border: round $panel;
+        margin: 0 1;
+    }
+
+    #reasoning-panes {
+        height: 1fr;
     }
 
     #event-log {
-        height: 12;
+        height: 8;
+        border: round $panel;
         margin: 0 1 1 1;
     }
     """
@@ -145,18 +154,19 @@ class RalphDashboardApp(App[None]):
     def compose(self) -> ComposeResult:
         yield Header(show_clock=False)
         yield Static(id="summary")
-        with Horizontal(id="main"):
+        with Horizontal(id="overview"):
             with Vertical(id="left-column"):
                 yield Static(id="banner")
                 yield Static(id="tasks")
                 yield Static(id="cost")
             with Vertical(id="right-column"):
                 yield Static(id="current-task")
-                yield Static(Text("Executor", style="bold"), id="executor-title")
-                yield RichLog(id="executor-log", wrap=True, markup=False, auto_scroll=True)
-                yield Static(Text("Reviewer", style="bold"), id="reviewer-title")
-                yield RichLog(id="reviewer-log", wrap=True, markup=False, auto_scroll=True)
-        yield Static(Text("Recent Events", style="bold"), id="events-title")
+        with Vertical(id="reasoning-panes"):
+            yield Static(Text("Executor Reasoning", style="bold cyan"), classes="reasoning-title")
+            yield RichLog(id="executor-log", wrap=True, markup=True, auto_scroll=True)
+            yield Static(Text("Reviewer Reasoning", style="bold magenta"), classes="reasoning-title")
+            yield RichLog(id="reviewer-log", wrap=True, markup=True, auto_scroll=True)
+        yield Static(Text("Events", style="bold dim"), id="events-title")
         yield RichLog(id="event-log", wrap=True, markup=False, auto_scroll=True)
         yield Footer()
 
@@ -311,10 +321,10 @@ class RalphDashboardApp(App[None]):
         )
 
         if self._executor_seen == 0 and self.renderer.executor_activity.active:
-            executor_log.write("waiting for provider output")
+            executor_log.write(Text("waiting for provider output...", style="dim italic"))
             self._executor_seen = -1
         if self._reviewer_seen == 0 and self.renderer.reviewer_activity.active:
-            reviewer_log.write("waiting for provider output")
+            reviewer_log.write(Text("waiting for provider output...", style="dim italic"))
             self._reviewer_seen = -1
 
     def _append_role_events(
@@ -349,7 +359,21 @@ class RalphDashboardApp(App[None]):
             seen_count = 0
 
         for event in textual[seen_count:]:
-            log.write(str(event.payload.get("text", "")).strip())
+            text = str(event.payload.get("text", "")).strip()
+            kind = event.payload.get("kind", "")
+            etype = event.event_type
+
+            if etype == ProviderEventType.AGENT_ERROR:
+                rendered = Text(f"ERROR: {text}", style="bold red")
+            elif etype == ProviderEventType.AGENT_STRUCTURED_OUTPUT:
+                rendered = Text(f"{text}", style="green")
+            elif kind == "progress":
+                rendered = Text(f"  {text}", style="dim")
+            else:
+                # Commentary / reasoning — the main content
+                rendered = Text(text)
+
+            log.write(rendered)
         return len(textual)
 
     def _sync_event_log(self, run_events) -> None:

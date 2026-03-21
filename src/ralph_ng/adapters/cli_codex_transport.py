@@ -43,6 +43,8 @@ class CliCodexTransport(Transport):
         self.tracker = tracker
         # Cancel event for graceful mid-stream interruption
         self.cancel_event: __import__("threading").Event | None = None
+        # Buffer for accumulating streaming text deltas into full thoughts
+        self._text_buffer: list[str] = []
 
     def invoke(
         self,
@@ -125,6 +127,9 @@ class CliCodexTransport(Transport):
                     os.unlink(schema_path)
                 except OSError:
                     pass
+        # Flush any remaining buffered text after stream ends
+        if self.tracker is not None:
+            self._flush_text_buffer()
         duration = time.monotonic() - started_at
 
         if stream_result.timed_out:
@@ -200,12 +205,15 @@ class CliCodexTransport(Transport):
         event_type = event.get("type", "")
 
         if event_type == "thread.started":
+            self._flush_text_buffer()
             self.tracker.push(make_activity(ActivityKind.PROGRESS, "review session started"))
 
         elif event_type == "turn.started":
+            self._flush_text_buffer()
             self.tracker.push(make_activity(ActivityKind.PROGRESS, "review turn started"))
 
         elif event_type == "turn.completed":
+            self._flush_text_buffer()
             self.tracker.push(make_activity(ActivityKind.RESULT, "review turn completed"))
 
         elif event_type == "item.started":
@@ -262,9 +270,17 @@ class CliCodexTransport(Transport):
         elif event_type == "response.output_text.delta":
             delta = event.get("delta", "")
             if isinstance(delta, str) and not self._looks_like_json(delta):
-                self._push_reasoning(delta)
+                self._text_buffer.append(delta)
+                # Flush on sentence boundaries or when buffer is large
+                if "\n" in delta:
+                    self._flush_text_buffer()
+                else:
+                    buffered = "".join(self._text_buffer)
+                    if len(buffered) >= 120:
+                        self._flush_text_buffer()
 
         elif event_type == "response.output_item.done":
+            self._flush_text_buffer()
             self.tracker.push(make_activity(ActivityKind.RESULT, "response item completed"))
 
         # Error events
@@ -288,17 +304,27 @@ class CliCodexTransport(Transport):
                     f"tokens {self._fmt_tokens(input_tokens or 0)} in / {self._fmt_tokens(output_tokens or 0)} out",
                 ))
 
-    def _push_reasoning(self, text: str) -> None:
-        """Push reasoning text as commentary, taking the last meaningful line."""
-        assert self.tracker is not None
-        if not text or len(text.strip()) < 5:
+    def _flush_text_buffer(self) -> None:
+        """Flush accumulated streaming text as commentary events."""
+        if not self._text_buffer or self.tracker is None:
             return
-        lines = text.strip().splitlines()
-        for line in reversed(lines):
+        full = "".join(self._text_buffer).strip()
+        self._text_buffer = []
+        if not full:
+            return
+        self._push_reasoning(full)
+
+    def _push_reasoning(self, text: str) -> None:
+        """Push reasoning text as one or more commentary events."""
+        assert self.tracker is not None
+        if not text or len(text.strip()) < 3:
+            return
+        stripped = text.strip()
+        lines = stripped.splitlines()
+        for line in lines:
             line = line.strip()
             if line and not self._looks_like_json(line):
-                self.tracker.push(make_activity(ActivityKind.COMMENTARY, line[:80]))
-                return
+                self.tracker.push(make_activity(ActivityKind.COMMENTARY, line))
 
     @staticmethod
     def _looks_like_json(text: str) -> bool:

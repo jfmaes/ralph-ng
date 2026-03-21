@@ -485,14 +485,10 @@ class ProgressRenderer:
             ))
             activity_lines = self.executor_activity.recent_lines
             if activity_lines:
-                for line in activity_lines:
-                    max_summary = 45 if narrow else 70
-                    summary = line[:max_summary]
-                    grid.add_row(Text(f"  > {summary}", style="dim italic"))
+                for line in activity_lines[-3:]:
+                    grid.add_row(Text(f"  > {line}", style="dim italic", overflow="ellipsis", no_wrap=True))
             elif self.executor_activity.latest_commentary:
-                max_commentary = 50 if narrow else 80
-                commentary = self.executor_activity.latest_commentary[:max_commentary]
-                grid.add_row(Text(f"  > {commentary}", style="dim italic"))
+                grid.add_row(Text(f"  > {self.executor_activity.latest_commentary}", style="dim italic", overflow="ellipsis", no_wrap=True))
             else:
                 grid.add_row(Text("  > waiting for provider output", style="dim italic"))
         else:
@@ -520,14 +516,10 @@ class ProgressRenderer:
                 grid.add_row(Text(f"  {round_label}", style="cyan"))
             activity_lines = self.reviewer_activity.recent_lines
             if activity_lines:
-                for line in activity_lines:
-                    max_summary = 45 if narrow else 70
-                    summary = line[:max_summary]
-                    grid.add_row(Text(f"  > {summary}", style="dim italic"))
+                for line in activity_lines[-3:]:
+                    grid.add_row(Text(f"  > {line}", style="dim italic", overflow="ellipsis", no_wrap=True))
             elif self.reviewer_activity.latest_commentary:
-                max_commentary = 50 if narrow else 80
-                commentary = self.reviewer_activity.latest_commentary[:max_commentary]
-                grid.add_row(Text(f"  > {commentary}", style="dim italic"))
+                grid.add_row(Text(f"  > {self.reviewer_activity.latest_commentary}", style="dim italic", overflow="ellipsis", no_wrap=True))
             else:
                 grid.add_row(Text("  > waiting for provider output", style="dim italic"))
         else:

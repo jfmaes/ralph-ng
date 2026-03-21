@@ -231,16 +231,18 @@ class CliClaudeTransport(Transport):
         self._push_reasoning(full)
 
     def _push_reasoning(self, text: str) -> None:
-        """Push commentary text, keeping only the last meaningful line."""
+        """Push commentary text as one or more activity events."""
         assert self.tracker is not None
         if not text:
             return
-        lines = text.strip().splitlines()
-        for line in reversed(lines):
+        stripped = text.strip()
+        if not stripped:
+            return
+        lines = stripped.splitlines()
+        for line in lines:
             line = line.strip()
             if line:
-                self.tracker.push(make_activity(ActivityKind.COMMENTARY, line[:80]))
-                return
+                self.tracker.push(make_activity(ActivityKind.COMMENTARY, line))
 
     def _extract_activity(self, event: dict[str, Any]) -> None:
         """Extract tool-use and commentary activity from Claude stream-json events.
@@ -302,10 +304,13 @@ class CliClaudeTransport(Transport):
                     text = delta.get("text", "")
                     if text:
                         self._text_buffer.append(text)
-                        # Flush when we have a sentence-worth of text
-                        buffered = "".join(self._text_buffer)
-                        if len(buffered) >= 40 or "\n" in text:
+                        # Flush on sentence boundaries or when buffer is large enough
+                        if "\n" in text:
                             self._flush_text_buffer()
+                        else:
+                            buffered = "".join(self._text_buffer)
+                            if len(buffered) >= 120:
+                                self._flush_text_buffer()
 
         # ── Block end: finalize tool or flush text ────────────────────
         elif event_type == "content_block_stop":

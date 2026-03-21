@@ -64,7 +64,7 @@ class LiveActivityTracker:
     Holds a bounded deque of recent ActivityEvents.
     """
 
-    def __init__(self, maxlen: int = 10) -> None:
+    def __init__(self, maxlen: int = 50) -> None:
         self._events: deque[ActivityEvent] = deque(maxlen=maxlen)
         self._lock = threading.Lock()
         self._sink: Callable[[ActivityEvent], None] | None = None
