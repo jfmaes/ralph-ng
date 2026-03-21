@@ -1,42 +1,16 @@
 # ralph-ng
 
-`ralph-ng` is a local autonomous coding orchestrator that runs against an already-approved implementation plan, persists enough state to resume after interruption, and keeps the operator informed about what the system is doing.
+`ralph-ng` is a local autonomous coding orchestrator that coordinates multiple AI models (Claude, Codex) to implement, review, and ship code changes against an approved implementation plan. It persists all state in SQLite, resumes after any interruption, and provides a live Textual dashboard.
 
-The current implementation covers the v0.1 workflow and v0.2 mixed-provider adversarial review:
+## What it does
 
-**v0.1 — Single-provider autonomous loop:**
-- Python package and CLI entrypoint
-- `ralph.toml` loading and validation
-- safe `ralph-plan.yaml` parsing and semantic validation
-- SQLite run/task/attempt/invocation state
-- append-only JSONL event logging
-- task lifecycle FSM and dependency-aware scheduling
-- executor prompt construction from task/spec/file context
-- Claude executor adapter with stream-json parsing
-- local verification command execution with timeouts
-- review bundle assembly for reviewer input
-- ratchet overlay persistence and validation
-- git branch/patch/commit/push safety helpers
-- resume reconciliation against persisted patch snapshots
-- sequential orchestration across executor, verification, reviewer, and git commit stages
-- working `validate-plan`, `start`, `resume`, and `status` commands
-- Rich-based progress snapshots, with live updates during `start`/`resume` in interactive terminals
-- end-to-end coverage with a real temporary git repo and mocked model adapters
-
-**v0.2 — Mixed-provider adversarial review (Claude executor + Codex reviewer):**
-- Transport ABC: provider-neutral, synchronous `Transport` interface for CLI subprocess invocations (API transport in v0.3)
-- CLI transports for both Claude (`claude -p --output-format stream-json --verbose`) and Codex (`codex exec --json`)
-- Role-based config: `[roles.executor]` and `[roles.reviewer]` sections with per-role provider/model/CLI settings
-- `ReviewFindings` schema: severity-graded, evidence-backed findings with stable IDs for cross-round tracking
-- Diff risk classification: size-based tiers, file count multipliers, path-based security/high-risk overrides
-- Independent first-pass review: reviewer never sees executor reasoning; anti-sycophancy protocol
-- Bounded adversarial challenge rounds: repair-first-then-explain, configurable thresholds
-- Human escalation policy: rejection loop exhaustion, low-confidence, critical risk, persistent security findings
-- Provider event persistence: JSONL per run/task/attempt for replay and observability
-- Provider activity panes in Rich progress renderer with review round indicators
-- Adapter factory: `build_executor()`, `build_reviewer()` from config; adding a new transport requires zero adapter changes
-- `[review]` config section: thresholds, challenge rounds, escalation, risk path overrides
-- Backward compatible: existing `[models]`-only configs still work for executor selection
+1. **Reads a plan** — a YAML file with tasks, dependencies, acceptance criteria, and verification commands
+2. **Executes tasks** — sends each task to an executor model (Claude) that writes code
+3. **Reviews adversarially** — an independent reviewer model (Codex) examines the diff without seeing executor reasoning
+4. **Challenges and repairs** — bounded challenge rounds where the executor fixes findings and the reviewer re-evaluates
+5. **Commits and continues** — accepted tasks are committed; rejected tasks are repaired or escalated
+6. **Self-heals** — classifies failures, diagnoses root causes, auto-fixes project dependencies
+7. **Survives interruption** — graceful pause/stop, force-kill recovery, stale controller adoption
 
 ## Quickstart
 
@@ -46,54 +20,249 @@ python3 -m venv .venv
 .venv/bin/ralph --help
 ```
 
-Validate a plan:
+Inside a git repository with `ralph-plan.yaml` and `ralph.toml`:
 
 ```bash
-.venv/bin/ralph validate-plan --plan docs/examples/ralph-plan.example.yaml --base-dir docs/examples
-```
-
-Start a run inside a git repository that contains `ralph-plan.yaml` and `ralph.toml`:
-
-```bash
-.venv/bin/ralph start
-.venv/bin/ralph status --run-id <run-id>
-.venv/bin/ralph resume --run-id <run-id>
+ralph start                          # start a new run
+ralph status --run-id <id>           # dashboard snapshot
+ralph status --run-id <id> --json    # machine-readable status
+ralph watch --run-id <id>            # attach to a running instance
+ralph resume --run-id <id>           # resume after interruption
+ralph stop                           # pause the active run
+ralph preflight                      # check environment before starting
+ralph doctor --run-id <id>           # diagnose a run's health
+ralph validate-plan                  # validate plan YAML
 ```
 
 Runtime state is written under `.git/ralph/`.
 
+## Architecture
+
+```
+ralph start → Orchestrator._run_loop()
+  ├─ Scheduler picks next task from plan
+  ├─ Executor (Claude) implements the task
+  ├─ Verification commands run locally
+  ├─ Reviewer (Codex) examines the diff independently
+  ├─ Challenge round if confidence is low or findings are critical
+  ├─ Accept → commit → next task
+  ├─ Reject → repair loop → retry
+  └─ Escalate → human intervention with structured guidance
+```
+
+### Adapter Layer
+
+```
+Transport (ABC)              ← provider-neutral invocation interface
+  ├─ CliClaudeTransport      ← claude -p <prompt> --output-format stream-json
+  └─ CliCodexTransport       ← codex exec --json <prompt>
+
+Adapter (ABC)                ← role-specific wrapping + retry logic
+  ├─ ClaudeExecutorAdapter   ← retry on malformed output
+  └─ CodexReviewerAdapter    ← JSON schema enforcement, parse retry
+
+Factory                      ← builds adapters from ralph.toml [roles] config
+```
+
+Adding a new provider requires only a new `Transport` implementation — no adapter or orchestrator changes.
+
+### Streaming Pipeline
+
+Provider CLI output flows through a multi-stage pipeline to the live dashboard:
+
+```
+Provider CLI (JSONL stdout)
+  → Transport._extract_activity()     # parse events, buffer text
+  → LiveActivityTracker.push()        # bounded deque, thread-safe
+  → Orchestrator sink                 # persist to JSONL as provider events
+  → TUI reads ProviderEventStore      # collapse thought blocks, render
+  → Full-width reasoning panes        # numbered thoughts with styled text
+```
+
+Reasoning arrives as streaming deltas grouped into **thought blocks**. The TUI collapses partial updates and displays them with numbered headers:
+
+```
+Thought 1
+  Let me analyze the authentication module...
+  The issue is in JWT validation on line 42.
+
+Thought 2
+  I'll fix the validation and add a test case.
+```
+
+### State Model
+
+All state lives in SQLite (`.git/ralph/state.db`) with WAL journaling:
+
+| Table | Purpose |
+|-------|---------|
+| `runs` | Run metadata, controller PID, heartbeat, stop reason |
+| `task_states` | Task FSM state, attempt count, failure classification |
+| `attempts` | Per-attempt artifacts (prompt, patch, review paths) |
+| `invocations` | Provider call records (tokens, duration, exit status) |
+| `recovery_attempts` | Self-healing diagnosis and auto-fix audit trail |
+
+### Task Lifecycle
+
+```
+PENDING → READY → IN_PROGRESS → REVIEW → DONE
+                       │            │
+                       │            ├─→ REPAIR → IN_PROGRESS (retry)
+                       │            ├─→ BLOCKED_HUMAN (escalated)
+                       │            └─→ BLOCKED_SYSTEM (provider failure)
+                       └─→ BLOCKED_SYSTEM (executor failure)
+```
+
+## Reliability
+
+### Failure Classification
+
+Every provider failure is classified into one of 15 categories (e.g., `PROVIDER_CRASH`, `PROVIDER_TIMEOUT`, `VERIFICATION_MISSING_BINARY`) with evidence-based rules. Each class maps to a recovery policy with bounded retries.
+
+### Self-Healing
+
+When enabled (default), failed tasks trigger a bounded diagnosis session:
+1. A separate provider analyzes the failure evidence
+2. If auto-fixable (project deps, verification rewrites): runs the fix commands
+3. If not: enriches the error message for human escalation
+
+Allowed auto-fixes: `npm install`, `pip install`, manifest updates, portable command rewrites.
+Never allowed: `sudo`, `apt`, `brew`, destructive git, credential setup.
+
+Configure in `ralph.toml`:
+```toml
+[self_healing]
+enabled = true
+diagnosis_provider = "claude"
+diagnosis_model = "opus"
+max_diagnosis_per_task = 1
+max_auto_fix_actions_per_task = 2
+```
+
+### Signal Handling
+
+| Input | Behavior |
+|-------|----------|
+| First `Ctrl+C` | Pause at next checkpoint, SIGTERM to subprocess |
+| Second `Ctrl+C` | Force kill children, release controller, exit |
+| TUI `p` | Pause at checkpoint, dashboard stays open |
+| TUI `s` | Stop at checkpoint, dashboard closes |
+| TUI `q` / `Ctrl+C` | Stop + close dashboard |
+| `ralph stop` | Write control file, controller pauses at next checkpoint |
+| `SIGTERM` | Same as second `Ctrl+C` |
+
+### Resume Recovery
+
+| Prior State | Workspace | Action |
+|-------------|-----------|--------|
+| `IN_PROGRESS` | Clean | Restart task (attempt not counted) |
+| `IN_PROGRESS` | Dirty | Auto-reset to HEAD, restart |
+| `REVIEW` | Any | Resume reviewer |
+| `REPAIR` | Any | Resume repair (rejection count preserved) |
+| `BLOCKED_SYSTEM` | Clean | Retry from READY |
+| `paused` | Any | Continue from last checkpoint |
+| Stale `running` | Any | Auto-adopt dead controller |
+
+### Controller Ownership
+
+Each run tracks its controller PID and heartbeat (updated every 5s). On `ralph start` or `ralph resume`, stale controllers (dead PID or heartbeat > 30s) are automatically adopted. File locking prevents concurrent starts.
+
+## Prompts
+
+All prompts are in `src/ralph_ng/prompts/`. Key design choices:
+
+- **Executor** (`prompt_builder.py`): dependency management contract, portable tool preference, verification checklist
+- **First-pass reviewer** (`reviewer_first_pass.py`): independence protocol, anti-sycophancy rules, severity calibration, single-output enforcement
+- **Challenge executor** (`challenge_executor.py`): repair-first-then-explain, environment fix permission
+- **Challenge reviewer** (`challenge_reviewer.py`): evaluate NEW diff independently, accept corrections with evidence
+- **Diagnostic debugger** (`diagnostic_debugger.py`): failure classification, auto-fix scope, structured JSON output
+
+See `docs/prompts.md` for the complete reference with schemas and construction flow.
+
+## Configuration
+
+Minimal config (`ralph.toml`):
+```toml
+[ralph]
+branch_prefix = "ralph/"
+max_retries_per_task = 3
+
+[models]
+executor = "sonnet"
+cli = "claude"
+
+[timeouts]
+executor_call_seconds = 600
+reviewer_call_seconds = 300
+```
+
+Mixed-provider config with adversarial review:
+```toml
+[roles.executor]
+provider = "claude"
+model = "sonnet"
+cli_path = "claude"
+
+[roles.reviewer]
+provider = "codex"
+model = "gpt-5.3-codex"
+cli_path = "codex"
+
+[review]
+enabled = true
+[review.thresholds]
+auto_accept_min_confidence = 0.95
+challenge_below_confidence = 0.80
+[review.escalation]
+max_rejection_loops = 3
+```
+
+See `docs/examples/ralph.toml.mixed-provider.example` for the full annotated config.
+
 ## Trust Boundary
 
-Operator-authored verification commands are intentionally shell-executed. That is part of the product contract for v0.1, and the repo/plan are treated as trusted input. `ralph-ng` does not sandbox arbitrary plan commands in v0.1.
+Operator-authored verification commands are intentionally shell-executed — the plan is trusted input. Reviewer-added ratchet commands pass through dangerous-pattern checks and executability validation before being stored as overlays.
 
-Evaluator-added ratchet commands are a narrower trust boundary. They are still shell commands, but they now pass through lightweight dangerous-pattern checks plus executability validation before they are stored as overlays.
+Self-healing auto-fix commands are restricted to a safe allowlist (package installs, portable rewrites). System-level commands (`sudo`, `apt`, etc.) are always blocked.
 
 ## Documentation
 
-- Example plan: `docs/examples/ralph-plan.example.yaml`
-- Example config (minimal): `docs/examples/ralph.toml.example`
-- Example config (mixed-provider): `docs/examples/ralph.toml.mixed-provider.example`
-- Example spec: `docs/examples/specs/example-spec.md`
-- Example ratchet overlay: `docs/examples/ratchet-overlay.example.yaml`
+- Architecture guide: `docs/architecture.md`
+- Prompt reference: `docs/prompts.md`
+- Reliability hardening spec: `docs/plans/2026-03-21-reliability-hardening-spec.md`
+- Example configs: `docs/examples/`
 - v0.2 spec: `docs/plans/2026-03-20-claude-executor-codex-reviewer-spec.md`
-- v0.2 implementation plan: `docs/plans/2026-03-20-claude-executor-codex-reviewer-implementation-plan.md`
-- E2E fixture repo: `tests/e2e/fixtures/`
 
-The example files are kept in sync with the current validators by automated tests.
+## Repo Layout
 
-## Current Repo Layout
-
-```text
-src/ralph_ng/           Application code
-tests/                  Unit tests and fixtures
-docs/examples/          Example plan, config, spec, and sample project files
-spec.md                 Product specification
-implementation_plan.md  Build plan plus completion tracker
-DESIGN.md               Background design rationale
 ```
-
-## Notes On Plans
-
-Plans are strict YAML and are loaded with `yaml.safe_load`. Task IDs must be strings, YAML anchors and aliases are rejected, and the validator enforces duplicate/dependency/cycle checks before execution is allowed.
-
-Use the example plan as the template for new plans. It is intentionally small and includes the fields the loader and validator currently expect.
+src/ralph_ng/
+  adapters/              Transport and adapter implementations
+  prompts/               All prompt templates
+  providers/             Provider event persistence
+  cli.py                 CLI commands (start, resume, stop, doctor, etc.)
+  orchestrator.py        Core loop, task execution, review, challenge
+  state.py               SQLite state store
+  config.py              TOML config loading and validation
+  failure.py             Failure classification and recovery policy
+  self_healing.py        Diagnosis sessions and auto-fix engine
+  preflight.py           Environment validation
+  resume.py              Resume reconciliation
+  tui.py                 Textual live dashboard
+  progress.py            Rich progress rendering
+  ratchet.py             Verification command overlay management
+  verification.py        Local command execution
+  review_findings.py     ReviewFindings/FindingResponse schemas
+  risk.py                Diff risk classification
+  git_manager.py         Git operations
+  fsm.py                 Task state machine
+  scheduler.py           Dependency-aware task scheduling
+  plan.py                Plan loading
+  validation.py          Plan validation
+  events.py              Event logging
+  review_bundle.py       Review context assembly
+  prompt_builder.py      Executor prompt construction
+  utils.py               Shared utilities
+tests/                   433 tests
+docs/                    Architecture, prompts, specs, examples
+```
