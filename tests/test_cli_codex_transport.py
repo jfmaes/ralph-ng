@@ -17,7 +17,7 @@ def make_jsonl(*events: dict) -> str:
 
 def _fake_stream(stdout_text: str, *, returncode: int = 0, stderr: str = "", timed_out: bool = False):
     """Return a patched stream_subprocess that feeds lines to on_line."""
-    def _mock(command, *, cwd=None, timeout_seconds=60, on_line=None, on_stderr_line=None, on_heartbeat=None, cancel_event=None, grace_seconds=5.0):
+    def _mock(command, *, cwd=None, timeout_seconds=60, stdin_path=None, on_line=None, on_stderr_line=None, on_heartbeat=None, cancel_event=None, grace_seconds=5.0):
         if on_line is not None:
             for line in stdout_text.splitlines(keepends=True):
                 on_line(line)
@@ -117,7 +117,7 @@ class TestCliCodexTransport:
         )
         calls: list[dict] = []
 
-        def capture(command, *, cwd=None, timeout_seconds=60, on_line=None, on_stderr_line=None, on_heartbeat=None, cancel_event=None, grace_seconds=5.0):
+        def capture(command, *, cwd=None, timeout_seconds=60, stdin_path=None, on_line=None, on_stderr_line=None, on_heartbeat=None, cancel_event=None, grace_seconds=5.0):
             calls.append({"cwd": cwd})
             if on_line is not None:
                 for line in stdout.splitlines(keepends=True):
@@ -142,7 +142,7 @@ class TestCliCodexTransport:
 
     def test_command_structure(self) -> None:
         transport = CliCodexTransport(model="gpt-5.3-codex", cli_path="/usr/bin/codex")
-        cmd, schema_path = transport._build_command("hello world", None)
+        cmd, schema_path, prompt_path = transport._build_command("hello world", None)
         assert cmd == [
             "/usr/bin/codex",
             "exec",
@@ -150,9 +150,12 @@ class TestCliCodexTransport:
             "--model", "gpt-5.3-codex",
             "--skip-git-repo-check",
             "--yolo",
-            "hello world",
+            "-",
         ]
         assert schema_path is None
+        with open(prompt_path, encoding="utf-8") as handle:
+            assert handle.read() == "hello world"
+        Path(prompt_path).unlink()
 
     def test_command_with_codex_overrides(self) -> None:
         transport = CliCodexTransport(
@@ -160,35 +163,45 @@ class TestCliCodexTransport:
             reasoning_effort="high",
             service_tier="fast",
         )
-        cmd, _ = transport._build_command("review", None)
+        cmd, _, prompt_path = transport._build_command("review", None)
         assert cmd[:6] == [
             "codex",
             "-c", 'service_tier="fast"',
             "-c", 'model_reasoning_effort="high"',
             "exec",
         ]
+        Path(prompt_path).unlink()
 
     def test_command_with_json_schema(self) -> None:
         transport = CliCodexTransport(model="gpt-5.3-codex")
         schema = {"type": "object", "properties": {"decision": {"type": "string"}}}
-        cmd, schema_path = transport._build_command("review", schema)
+        cmd, schema_path, prompt_path = transport._build_command("review", schema)
         assert "--output-schema" in cmd
         schema_idx = cmd.index("--output-schema") + 1
         with open(cmd[schema_idx]) as f:
             loaded = json.load(f)
         assert loaded == schema
-        # Prompt should still be last arg
-        assert cmd[-1] == "review"
+        # Prompt should still be last arg marker and delivered via stdin file
+        assert cmd[-1] == "-"
         assert schema_path == cmd[schema_idx]
+        with open(prompt_path, encoding="utf-8") as handle:
+            assert handle.read() == "review"
+        Path(schema_path).unlink()
+        Path(prompt_path).unlink()
 
     def test_invoke_cleans_up_schema_file(self) -> None:
         schema_paths: list[Path] = []
+        prompt_paths: list[Path] = []
 
-        def capture(command, *, cwd=None, timeout_seconds=60, on_line=None, on_stderr_line=None, on_heartbeat=None, cancel_event=None, grace_seconds=5.0):
+        def capture(command, *, cwd=None, timeout_seconds=60, stdin_path=None, on_line=None, on_stderr_line=None, on_heartbeat=None, cancel_event=None, grace_seconds=5.0):
             schema_idx = command.index("--output-schema") + 1
             schema_path = Path(command[schema_idx])
             schema_paths.append(schema_path)
             assert schema_path.exists()
+            assert stdin_path is not None
+            prompt_path = Path(stdin_path)
+            prompt_paths.append(prompt_path)
+            assert prompt_path.exists()
             if on_line is not None:
                 on_line(json.dumps({"type": "item.completed", "item": {"type": "agent_message", "text": "ok"}}) + "\n")
             return StreamResult(returncode=0, stderr_text="", timed_out=False)
@@ -198,7 +211,28 @@ class TestCliCodexTransport:
             transport.invoke("review", timeout_seconds=60.0, json_schema={"type": "object"})
 
         assert len(schema_paths) == 1
+        assert len(prompt_paths) == 1
         assert not schema_paths[0].exists()
+        assert not prompt_paths[0].exists()
+
+    def test_invoke_passes_prompt_via_stdin_file(self) -> None:
+        captured: dict[str, str] = {}
+
+        def capture(command, *, cwd=None, timeout_seconds=60, stdin_path=None, on_line=None, on_stderr_line=None, on_heartbeat=None, cancel_event=None, grace_seconds=5.0):
+            captured["prompt_arg"] = command[-1]
+            assert stdin_path is not None
+            with open(stdin_path, encoding="utf-8") as handle:
+                captured["prompt_text"] = handle.read()
+            if on_line is not None:
+                on_line(json.dumps({"type": "item.completed", "item": {"type": "agent_message", "text": "ok"}}) + "\n")
+            return StreamResult(returncode=0, stderr_text="", timed_out=False)
+
+        with patch("ralph_ng.adapters.cli_codex_transport.stream_subprocess", side_effect=capture):
+            transport = CliCodexTransport(model="gpt-5.3-codex")
+            transport.invoke("review this code", timeout_seconds=60.0)
+
+        assert captured["prompt_arg"] == "-"
+        assert captured["prompt_text"] == "review this code"
 
     def test_event_callback(self) -> None:
         captured: list[dict] = []
@@ -214,6 +248,35 @@ class TestCliCodexTransport:
 
         assert len(captured) == 2
         assert captured[0]["type"] == "thread.started"
+
+    def test_tracker_reports_unexpected_raw_output(self) -> None:
+        stdout = "not-json-at-all\n" + make_jsonl(
+            {"type": "item.completed", "item": {"type": "agent_message", "text": "ok"}},
+        )
+        tracker = LiveActivityTracker()
+
+        with patch("ralph_ng.adapters.cli_codex_transport.stream_subprocess",
+                    side_effect=_fake_stream(stdout)):
+            transport = CliCodexTransport(model="gpt-5.3-codex", tracker=tracker)
+            result = transport.invoke("review", timeout_seconds=60.0)
+
+        assert result.status is InvocationStatus.COMPLETED
+        summaries = [e.summary for e in tracker.recent_display(5)]
+        assert any("unexpected codex output" in s for s in summaries)
+
+    def test_plain_agent_message_text_is_visible_in_tracker(self) -> None:
+        stdout = make_jsonl(
+            {"type": "item.completed", "item": {"type": "agent_message", "text": "Hello reviewer"}},
+        )
+        tracker = LiveActivityTracker()
+
+        with patch("ralph_ng.adapters.cli_codex_transport.stream_subprocess",
+                    side_effect=_fake_stream(stdout)):
+            transport = CliCodexTransport(model="gpt-5.3-codex", tracker=tracker)
+            transport.invoke("review", timeout_seconds=60.0)
+
+        summaries = [e.summary for e in tracker.recent_display(5)]
+        assert any("Hello reviewer" in s for s in summaries)
 
     def test_tracker_filters_json_output(self) -> None:
         """Structured JSON output from agent_message should NOT appear as commentary."""
@@ -235,13 +298,15 @@ class TestCliCodexTransport:
         # Structured output should be summarized, not echoed back verbatim.
         recent = tracker.recent_display(3)
         assert recent
-        assert any("structured review output received" in e.summary for e in recent)
+        assert any(
+            "structured review output received" in e.summary or "reject (0.34)" in e.summary
+            for e in recent
+        )
         # Verify the JSON wasn't pushed verbatim
         with tracker._lock:
             all_events = list(tracker._events)
         for e in all_events:
             assert "decision" not in e.summary
-            assert "reject" not in e.summary
 
     def test_tracker_receives_progress_events(self) -> None:
         stdout = make_jsonl(

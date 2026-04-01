@@ -9,12 +9,15 @@
 [ralph]
 branch_prefix = "ralph/"
 auto_push = false
-max_retries_per_task = 3
+max_retries_per_task = 5
 max_ratchet_checks_per_task = 10
+# Use only if your default executor is a less capable model.
+# auto_escalate = 4
+auto_escalate_model = "opus"
 
 # Legacy [models] section — fallback for executor when [roles] is absent.
 [models]
-executor = "sonnet"
+executor = "opus"
 cli = "claude"
 
 [timeouts]
@@ -31,7 +34,7 @@ force_push = false
 [roles.executor]
 provider = "claude"           # "claude" or "codex"
 transport = "cli"             # "cli" now; "api" in v0.3
-model = "sonnet"
+model = "opus"
 cli_path = "claude"
 # base_url = ""              # reserved for v0.3 API transport
 # api_key_env = ""           # reserved for v0.3 API transport

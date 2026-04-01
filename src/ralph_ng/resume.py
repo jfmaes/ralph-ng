@@ -106,70 +106,25 @@ class ResumeManager:
         task: Task,
         record: TaskStateRecord,
     ) -> ResumeDecision:
-        state = TaskState(record.state)
+        # Any non-DONE task is incomplete.  Roll back to the last commit
+        # and restart the task from scratch — partial executor output,
+        # pending reviews, and repair loops are all discarded.
+        if not self.git_manager.is_clean():
+            self.git_manager.reset_to_head_clean()
 
-        if state is TaskState.REVIEW:
-            self.store.transition_task(
-                run_id,
-                task.id,
-                TaskState.REVIEW,
-                attempt_count=record.attempt_count,
-                last_error=record.last_error,
-            )
-            return ResumeDecision(
-                action=ResumeAction.CONTINUE,
-                task_id=task.id,
-                resume_state=TaskState.REVIEW,
-                reason="Resuming reviewer work for the interrupted task.",
-            )
-
-        if state is TaskState.REPAIR:
-            self.store.transition_task(
-                run_id,
-                task.id,
-                TaskState.REPAIR,
-                attempt_count=record.attempt_count,
-                last_error=record.last_error,
-            )
-            return ResumeDecision(
-                action=ResumeAction.CONTINUE,
-                task_id=task.id,
-                resume_state=TaskState.REPAIR,
-                reason="Resuming repair flow for the interrupted task.",
-            )
-
-        if state is TaskState.IN_PROGRESS:
-            if not self.git_manager.is_clean():
-                # Dirty workspace from interrupted executor — reset to last commit
-                # and let the executor re-implement the task from scratch.  The LLM
-                # can handle partial code, but a clean slate is safer and avoids
-                # confusion about which changes were intentional.
-                self.git_manager.reset_to_head_clean()
-
-            restarted_attempt_count = max(record.attempt_count - 1, 0)
-            self.store.transition_task(
-                run_id,
-                task.id,
-                TaskState.READY,
-                attempt_count=restarted_attempt_count,
-                last_error=None,
-            )
-            reason = (
-                "Reset interrupted executor changes and restarting the task."
-                if not self.git_manager.is_clean()
-                else "Restarting the interrupted executor attempt from a clean workspace."
-            )
-            return ResumeDecision(
-                action=ResumeAction.CONTINUE,
-                task_id=task.id,
-                resume_state=TaskState.READY,
-                reason=reason,
-            )
-
+        restarted_attempt_count = max(record.attempt_count - 1, 0)
+        self.store.transition_task(
+            run_id,
+            task.id,
+            TaskState.READY,
+            attempt_count=restarted_attempt_count,
+            last_error=None,
+        )
         return ResumeDecision(
-            action=ResumeAction.BLOCKED_HUMAN,
+            action=ResumeAction.CONTINUE,
             task_id=task.id,
-            reason=f"Cannot safely resume task {task.id} from state {record.state}.",
+            resume_state=TaskState.READY,
+            reason=f"Rolling back incomplete task {task.id} to last commit and restarting.",
         )
 
     def _recover_from_head_rollback(

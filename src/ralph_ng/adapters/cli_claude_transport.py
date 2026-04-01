@@ -97,6 +97,7 @@ class CliClaudeTransport(Transport):
         error_message: str | None = None
         events: list[dict[str, Any]] = []
         captured_session_id: list[str] = []  # mutable container for closure
+        unexpected_lines: list[str] = []
 
         def _on_line(raw_line: str) -> None:
             nonlocal input_tokens, output_tokens, error_type, error_message
@@ -107,11 +108,13 @@ class CliClaudeTransport(Transport):
             try:
                 event = json.loads(line)
             except json.JSONDecodeError:
-                # Strict mode for Claude — malformed line is a real problem.
-                # Record it but continue to accumulate what we can.
+                unexpected_lines.append(line)
+                self._report_unexpected_output(line)
                 return
 
             if not isinstance(event, dict):
+                unexpected_lines.append(line)
+                self._report_unexpected_output(line)
                 return
 
             events.append(event)
@@ -139,11 +142,17 @@ class CliClaudeTransport(Transport):
 
             # Extract tool activity for live tracker
             if self.tracker is not None:
-                self._extract_activity(event)
+                try:
+                    self._extract_activity(event)
+                except Exception as exc:
+                    self._report_tracker_error(exc, str(event.get("type", "")))
 
             # Emit raw event for persistence
             if self._on_event is not None:
-                self._on_event(event)
+                try:
+                    self._on_event(event)
+                except Exception as exc:
+                    self._report_tracker_error(exc, f"persist {event.get('type', '')}")
 
         started_at = time.monotonic()
         stream_result = stream_subprocess(
@@ -181,7 +190,7 @@ class CliClaudeTransport(Transport):
         if not events and not output_text:
             return TransportResult(
                 status=InvocationStatus.MALFORMED_OUTPUT,
-                output_text="",
+                output_text="\n".join(unexpected_lines),
                 duration_seconds=duration,
                 error_message="Claude produced no parseable output",
                 exit_status=stream_result.returncode,
@@ -218,6 +227,23 @@ class CliClaudeTransport(Transport):
             stderr_text=stream_result.stderr_text,
             raw_events=events,
         )
+
+    def _report_unexpected_output(self, line: str) -> None:
+        if self.tracker is not None:
+            snippet = line[:160]
+            self.tracker.push(make_activity(
+                ActivityKind.PROGRESS,
+                f"unexpected claude output: {snippet}",
+                text=f"unexpected claude output: {snippet}",
+            ))
+
+    def _report_tracker_error(self, exc: Exception, context: str) -> None:
+        if self.tracker is not None:
+            self.tracker.push(make_activity(
+                ActivityKind.ERROR,
+                f"claude stream handling error ({context}): {exc}",
+                text=f"claude stream handling error ({context}): {exc}",
+            ))
 
     def health_check(self) -> bool:
         """Check if the claude CLI is available on PATH."""
@@ -343,7 +369,7 @@ class CliClaudeTransport(Transport):
                             self._flush_text_buffer()
                         else:
                             buffered = "".join(self._text_buffer)
-                            if len(buffered) >= 120:
+                            if len(buffered) >= 40:
                                 self._flush_text_buffer()
 
         # ── Block end: finalize tool or flush text ────────────────────

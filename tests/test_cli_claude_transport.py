@@ -265,6 +265,21 @@ class TestCliClaudeTransport:
         assert len(captured) == 2
         assert captured[0]["type"] == "message_start"
 
+    def test_tracker_reports_unexpected_raw_output(self) -> None:
+        stdout = "not-json-at-all\n" + make_stream(
+            {"type": "message_start", "usage": {"input_tokens": 1, "output_tokens": 0}},
+        )
+        tracker = LiveActivityTracker()
+
+        with patch("ralph_ng.adapters.cli_claude_transport.stream_subprocess",
+                    side_effect=_fake_stream(stdout)):
+            transport = CliClaudeTransport(model="sonnet", tracker=tracker)
+            result = transport.invoke("test", timeout_seconds=10.0)
+
+        assert result.status is InvocationStatus.COMPLETED
+        summaries = [e.summary for e in tracker.recent_display(5)]
+        assert any("unexpected claude output" in s for s in summaries)
+
     def test_tracker_receives_tool_activity(self) -> None:
         """Real Claude stream-json format: content_block_start/delta/stop sequence."""
         stdout = make_stream(

@@ -12,7 +12,7 @@ def test_example_config_loads() -> None:
 
     config = load_config(root / "ralph.toml.example")
 
-    assert config.models.executor == "sonnet"
+    assert config.models.executor == "opus"
     assert config.git.protected_branches == ["main", "master"]
 
 

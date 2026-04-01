@@ -43,7 +43,7 @@ class ProviderEventStore:
         if not path.exists():
             return []
         events: list[ProviderEvent] = []
-        with path.open("r", encoding="utf-8") as fh:
+        with path.open("r", encoding="utf-8", errors="replace") as fh:
             for line in fh:
                 line = line.strip()
                 if not line:

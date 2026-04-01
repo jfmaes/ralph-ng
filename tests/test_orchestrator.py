@@ -209,6 +209,32 @@ def executor_retry_marker(repo_root: Path, attempt_number: int) -> ExecutorResul
     )
 
 
+class TrackingExecutor:
+    def __init__(self, repo_root: Path) -> None:
+        self.repo_root = repo_root
+        self.transport = type("TransportState", (), {"model": "sonnet"})()
+        self.models_seen: list[str] = []
+
+    def execute(
+        self,
+        prompt: str,
+        *,
+        timeout_seconds: int | float,
+        cwd: str | Path | None = None,
+    ) -> ExecutorResult:
+        self.models_seen.append(self.transport.model)
+        with (self.repo_root / "work.txt").open("a", encoding="utf-8") as handle:
+            handle.write("TASK-001\n")
+        return ExecutorResult(
+            status=InvocationStatus.COMPLETED,
+            output_text=f"applied with {self.transport.model}",
+            input_tokens=10,
+            output_tokens=5,
+            duration_seconds=0.01,
+            exit_status=0,
+        )
+
+
 def accept_verdict(summary: str = "ok") -> callable:
     def _behavior(attempt_number: int) -> ReviewResult:
         return ReviewResult(
@@ -249,6 +275,37 @@ def reject_with_overlay(summary: str = "needs more work") -> callable:
                 new_verification_commands=[
                     f"{sys.executable} -c \"from pathlib import Path; "
                     "text=Path('work.txt').read_text(); assert 'retry-marker' in text\""
+                ],
+            ),
+            input_tokens=7,
+            output_tokens=4,
+            duration_seconds=0.01,
+        )
+    return _behavior
+
+
+def reject_with_unique_overlay() -> callable:
+    def _behavior(attempt_number: int) -> ReviewResult:
+        return ReviewResult(
+            status=InvocationStatus.COMPLETED,
+            findings=ReviewFindings(
+                decision="reject",
+                confidence=0.92,
+                spec_compliance="fail",
+                summary=f"needs more work {attempt_number}",
+                findings=[
+                    ReviewFinding(
+                        id=f"F{attempt_number}",
+                        severity=FindingSeverity.IMPORTANT,
+                        category=FindingCategory.CORRECTNESS,
+                        description=f"Add the retry marker variant {attempt_number}.",
+                        evidence="work.txt missing retry-marker",
+                    ),
+                ],
+                repair_notes=f"Add the retry marker variant {attempt_number}.",
+                new_verification_commands=[
+                    f"{sys.executable} -c \"from pathlib import Path; "
+                    "text=Path('work.txt').read_text(); assert 'TASK-001' in text\""
                 ],
             ),
             input_tokens=7,
@@ -351,6 +408,32 @@ def test_retry_flow_rejects_once_then_accepts(tmp_path: Path) -> None:
     overlay_path = tmp_path / "state-root" / "runs" / "run-001" / "overlays" / "TASK-001.yaml"
     assert overlay_path.exists()
     assert "retry-marker" in (repo / "work.txt").read_text(encoding="utf-8")
+
+
+def test_auto_escalates_executor_model_from_attempt_threshold(tmp_path: Path) -> None:
+    repo = init_repo(tmp_path)
+    plan = make_plan(1)
+    executor = TrackingExecutor(repo)
+    reviewer = FakeReviewer(
+        {
+            "TASK-001": [
+                reject_with_unique_overlay(),
+                reject_with_unique_overlay(),
+                reject_with_unique_overlay(),
+                accept_verdict("fixed with escalation"),
+            ]
+        }
+    )
+    _, store, _, orchestrator = make_orchestrator(tmp_path, plan, executor, reviewer, max_retries=5)
+    orchestrator.config.ralph.auto_escalate = 4
+    orchestrator.config.ralph.auto_escalate_model = "opus"
+    orchestrator.config.review.escalation.max_rejection_loops = 10
+
+    outcome = orchestrator.start(run_id="run-001")
+
+    assert outcome.status is RunStatus.COMPLETED
+    assert store.get_task_state("run-001", "TASK-001").attempt_count == 4
+    assert executor.models_seen == ["sonnet", "sonnet", "sonnet", "opus"]
 
 
 def test_accepts_clean_tree_without_creating_new_commit(tmp_path: Path) -> None:

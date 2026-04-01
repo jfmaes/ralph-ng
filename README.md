@@ -1,6 +1,14 @@
 # ralph-ng
 
-`ralph-ng` is a local autonomous coding orchestrator that coordinates multiple AI models (Claude, Codex) to implement, review, and ship code changes against an approved implementation plan. It persists all state in SQLite, resumes after any interruption, and provides a live Textual dashboard.
+`ralph-ng` is a local autonomous coding orchestrator for running approved implementation plans inside a git repository with durable state, adversarial review, bounded repair loops, and a live Textual dashboard.
+
+![ralph-ng dashboard](docs/image/ralphng.png)
+
+It coordinates multiple AI models, local verification commands, and recovery logic so long-running coding sessions can survive interruption and keep a readable audit trail.
+
+## Origins
+
+`ralph-ng` builds on the original [`ralph`](https://github.com/snarktank/ralph) loop project and later workflow experiments such as [`awesome-ai-workflow`](https://github.com/jfmaes/awesome-ai-workflow/tree/v1.1). Credit goes to the original `ralph` project for proving that a simple autonomous coding loop could take a repo from prompt to committed code; `ralph-ng` extends that idea with persisted state, cross-model review, challenge rounds, and a live operator dashboard.
 
 ## What it does
 
@@ -12,13 +20,39 @@
 6. **Self-heals** — classifies failures, diagnoses root causes, auto-fixes project dependencies
 7. **Survives interruption** — graceful pause/stop, force-kill recovery, stale controller adoption
 
-## Quickstart
+## Installation
+
+`ralph-ng` is currently released repo-first. Clone the repository to get the
+orchestrator together with the bundled `skills/` workflows.
+
+For local development from a checkout:
 
 ```bash
+git clone https://github.com/jfmaes/ralph-ng.git
+cd ralph-ng
 python3 -m venv .venv
 .venv/bin/pip install -e '.[dev]'
 .venv/bin/ralph --help
 ```
+
+For a regular local install from the repo without editable mode:
+
+```bash
+git clone https://github.com/jfmaes/ralph-ng.git
+cd ralph-ng
+python3 -m pip install .
+ralph --help
+```
+
+If you want to build a distributable artifact locally:
+
+```bash
+python3 -m build
+python3 -m pip install dist/ralph_ng-0.1.0-py3-none-any.whl
+ralph --help
+```
+
+## Quickstart
 
 Inside a git repository with `ralph-plan.yaml` and `ralph.toml`:
 
@@ -37,6 +71,30 @@ ralph validate-plan                  # validate plan YAML
 ```
 
 Runtime state is written under `.git/ralph/`.
+
+## External Dependencies
+
+`ralph-ng` is a Python package, but it orchestrates external model CLIs. A
+working installation also needs the provider binaries you configure in
+`ralph.toml`, typically:
+
+- `claude` for the executor
+- `codex` for the reviewer
+
+Run `ralph preflight` before starting a run to confirm the configured binaries
+and verification tools are present.
+
+## Skills
+
+The repository also includes a top-level `skills/` directory with
+model-agnostic Markdown-plus-script workflows such as plan conversion, plan
+repair, run triage, and repo initialization.
+
+Those skills are not a runtime dependency of the `ralph` CLI itself, but they
+are part of the intended repository workflow and are shipped with the repo
+release. `ralph start`, `resume`, `watch`, and the rest do not read from
+`skills/` at runtime; the skills are companion workflows for planning, repair,
+triage, and initialization.
 
 ## Architecture
 
@@ -187,10 +245,13 @@ Minimal config (`ralph.toml`):
 ```toml
 [ralph]
 branch_prefix = "ralph/"
-max_retries_per_task = 3
+max_retries_per_task = 5
+# Use only if your default executor is a less capable model.
+# auto_escalate = 4
+auto_escalate_model = "opus"
 
 [models]
-executor = "sonnet"
+executor = "opus"
 cli = "claude"
 
 [timeouts]
@@ -202,7 +263,7 @@ Mixed-provider config with adversarial review:
 ```toml
 [roles.executor]
 provider = "claude"
-model = "sonnet"
+model = "opus"
 cli_path = "claude"
 
 [roles.reviewer]
@@ -231,6 +292,7 @@ Self-healing auto-fix commands are restricted to a safe allowlist (package insta
 
 - Architecture guide: `docs/architecture.md`
 - Prompt reference: `docs/prompts.md`
+- Skills guide: `skills/README.md`
 - Reliability hardening spec: `docs/plans/2026-03-21-reliability-hardening-spec.md`
 - Example configs: `docs/examples/`
 - v0.2 spec: `docs/plans/2026-03-20-claude-executor-codex-reviewer-spec.md`
@@ -267,4 +329,5 @@ src/ralph_ng/
   utils.py               Shared utilities
 tests/                   433 tests
 docs/                    Architecture, prompts, specs, examples
+skills/                  Agent workflows and helper scripts
 ```

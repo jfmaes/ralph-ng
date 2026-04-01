@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import mimetypes
 from pathlib import Path
+from typing import Iterable
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -81,19 +83,35 @@ class ReviewBundleBuilder:
         repair_notes: str | None = None,
         ratchet_overlay_history: list[str] | None = None,
     ) -> ReviewBundle:
-        changed_file_snippets: dict[str, str] = {}
-        for relative_path in task.expected_files:
-            file_path = self.repo_root / relative_path
-            if file_path.exists():
-                changed_file_snippets[relative_path] = file_path.read_text(encoding="utf-8").rstrip()
-            else:
-                changed_file_snippets[relative_path] = "(file does not exist yet)"
-
         return ReviewBundle(
             task=task,
             git_diff=git_diff,
-            changed_file_snippets=changed_file_snippets,
+            changed_file_snippets=collect_changed_file_snippets(self.repo_root, task.expected_files),
             verification_results=verification_results,
             repair_notes=repair_notes,
             ratchet_overlay_history=ratchet_overlay_history or [],
         )
+
+
+def collect_changed_file_snippets(repo_root: str | Path, expected_files: Iterable[str]) -> dict[str, str]:
+    snippets: dict[str, str] = {}
+    root = Path(repo_root)
+    for relative_path in expected_files:
+        file_path = root / relative_path
+        if not file_path.exists():
+            snippets[relative_path] = "(file does not exist yet)"
+            continue
+        snippets[relative_path] = _read_review_snippet(file_path)
+    return snippets
+
+
+def _read_review_snippet(file_path: Path) -> str:
+    try:
+        return file_path.read_text(encoding="utf-8").rstrip()
+    except UnicodeDecodeError:
+        mime_type, _ = mimetypes.guess_type(file_path.name)
+        size = file_path.stat().st_size
+        detail = mime_type or "application/octet-stream"
+        return f"(binary file: {detail}, {size} bytes)"
+    except OSError as exc:
+        return f"(unable to read file: {exc})"

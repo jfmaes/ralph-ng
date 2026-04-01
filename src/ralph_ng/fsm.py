@@ -35,11 +35,13 @@ ALLOWED_TRANSITIONS: dict[TaskState, set[TaskState]] = {
         TaskState.BLOCKED_SYSTEM,
     },
     TaskState.IN_PROGRESS: {
+        TaskState.READY,
         TaskState.REVIEW,
         TaskState.BLOCKED_HUMAN,
         TaskState.BLOCKED_SYSTEM,
     },
     TaskState.REVIEW: {
+        TaskState.READY,
         TaskState.DONE,
         TaskState.REPAIR,
         TaskState.FAILED_EXHAUSTED,
@@ -47,25 +49,30 @@ ALLOWED_TRANSITIONS: dict[TaskState, set[TaskState]] = {
         TaskState.BLOCKED_SYSTEM,
     },
     TaskState.REPAIR: {
+        TaskState.READY,
         TaskState.IN_PROGRESS,
         TaskState.REVIEW,
         TaskState.BLOCKED_HUMAN,
         TaskState.BLOCKED_SYSTEM,
     },
     TaskState.BLOCKED_HUMAN: {
+        TaskState.PENDING,
         TaskState.READY,
         TaskState.IN_PROGRESS,
         TaskState.REVIEW,
         TaskState.REPAIR,
     },
     TaskState.BLOCKED_SYSTEM: {
+        TaskState.PENDING,
         TaskState.READY,
         TaskState.IN_PROGRESS,
         TaskState.REVIEW,
         TaskState.REPAIR,
     },
     TaskState.DONE: set(),
-    TaskState.FAILED_EXHAUSTED: set(),
+    TaskState.FAILED_EXHAUSTED: {
+        TaskState.PENDING,
+    },
 }
 
 

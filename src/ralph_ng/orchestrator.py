@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 import json
 from pathlib import Path
+import subprocess
 import threading
 import time
 
@@ -27,7 +28,7 @@ from .prompts.reviewer_first_pass import build_first_pass_prompt
 from .prompts.challenge_executor import build_challenge_executor_prompt
 from .prompts.challenge_reviewer import build_challenge_reviewer_prompt
 from .ratchet import RatchetManager
-from .review_bundle import ReviewBundleBuilder
+from .review_bundle import ReviewBundleBuilder, collect_changed_file_snippets
 from .review_findings import (
     FindingResponse,
     ReviewFindings,
@@ -222,13 +223,31 @@ class Orchestrator:
             stop_reason = None
             if self._shutdown_requested.is_set():
                 stop_reason = json.dumps({"cause": "operator_interrupt"})
+                # Clean up uncommitted changes from the interrupted run.
+                # Review-ready work is committed; partial work is discarded.
+                self._cleanup_on_pause(run_id)
             self.store.release_controller(run_id, stop_reason=stop_reason)
 
-    def resume(self, *, run_id: str, task_limit: int | None = None) -> RunOutcome:
+    def resume(
+        self,
+        *,
+        run_id: str,
+        task_limit: int | None = None,
+        max_retries: int | None = None,
+    ) -> RunOutcome:
         import os as _os
         if self.store.get_run(run_id) is None:
             raise OrchestratorError(f"Unknown run {run_id}.")
         self._ensure_run_paths(run_id)
+
+        # Reset blocked/failed tasks so they can be retried.
+        # With --max-retries: increase budget and continue from current attempt.
+        # Without (default): discard changes and restart from scratch.
+        self._reset_blocked_tasks(run_id, max_retries=max_retries)
+
+        if max_retries is not None:
+            self.config.ralph.max_retries_per_task = max_retries
+
         self.store.acquire_controller(run_id, _os.getpid())
         self._start_heartbeat(run_id)
         self.store.update_run_status(run_id, RunStatus.RUNNING)
@@ -241,7 +260,80 @@ class Orchestrator:
             stop_reason = None
             if self._shutdown_requested.is_set():
                 stop_reason = json.dumps({"cause": "operator_interrupt"})
+                self._cleanup_on_pause(run_id)
             self.store.release_controller(run_id, stop_reason=stop_reason)
+
+    def _reset_blocked_tasks(
+        self,
+        run_id: str,
+        *,
+        max_retries: int | None = None,
+    ) -> None:
+        """Reset blocked/failed tasks so they can be retried.
+
+        With max_retries set: keep current attempt count (continue where left off).
+        Without (default): reset to pending with attempt_count=0 (restart from scratch).
+        """
+        task_states = self.store.list_task_states(run_id)
+        for task_id, record in task_states.items():
+            if record.state == TaskState.BLOCKED_HUMAN:
+                # Blocked tasks always reset to pending — the human has
+                # resolved the issue.
+                self._rejection_counts.pop(task_id, None)
+                self._transition(
+                    run_id, task_id, TaskState.PENDING,
+                    attempt_count=0, last_error=None,
+                )
+                self.events.log(
+                    "task.transition",
+                    task_id=task_id,
+                    data={
+                        "run_id": run_id,
+                        "from_state": record.state,
+                        "to_state": TaskState.PENDING,
+                        "attempt_count": 0,
+                        "reason": "reset_on_resume",
+                    },
+                )
+            elif record.state == TaskState.FAILED_EXHAUSTED:
+                self._rejection_counts.pop(task_id, None)
+                if max_retries is not None:
+                    # Continue from current state with a higher budget.
+                    # Reset to REPAIR so the executor retries with existing code.
+                    self._transition(
+                        run_id, task_id, TaskState.PENDING,
+                        attempt_count=record.attempt_count,
+                        last_error=record.last_error,
+                    )
+                    self.events.log(
+                        "task.transition",
+                        task_id=task_id,
+                        data={
+                            "run_id": run_id,
+                            "from_state": record.state,
+                            "to_state": TaskState.PENDING,
+                            "attempt_count": record.attempt_count,
+                            "reason": "retry_budget_increased",
+                            "max_retries": max_retries,
+                        },
+                    )
+                else:
+                    # Default: discard and restart from scratch.
+                    self._transition(
+                        run_id, task_id, TaskState.PENDING,
+                        attempt_count=0, last_error=None,
+                    )
+                    self.events.log(
+                        "task.transition",
+                        task_id=task_id,
+                        data={
+                            "run_id": run_id,
+                            "from_state": record.state,
+                            "to_state": TaskState.PENDING,
+                            "attempt_count": 0,
+                            "reason": "reset_on_resume",
+                        },
+                    )
 
     def request_shutdown(self) -> None:
         """Signal the orchestrator to pause at the next safe checkpoint."""
@@ -277,6 +369,18 @@ class Orchestrator:
             self._heartbeat_thread.join(timeout=2.0)
             self._heartbeat_thread = None
 
+    def _cleanup_on_pause(self, run_id: str) -> None:
+        """Discard uncommitted changes left by an interrupted run.
+
+        Only committed (DONE) work survives a pause.  Everything else is
+        rolled back so that resume starts the incomplete task from scratch.
+        """
+        try:
+            if not self.git_manager.is_clean():
+                self.git_manager.reset_to_head_clean()
+        except Exception:
+            pass  # best-effort; don't mask the real pause outcome
+
     def _check_shutdown(self, run_id: str) -> RunOutcome | None:
         """Return a paused outcome if shutdown was requested, else None."""
         if not self._shutdown_requested.is_set():
@@ -299,7 +403,129 @@ class Orchestrator:
         )
         return RunOutcome(run_id=run_id, status=RunStatus.PAUSED, reason="Operator requested pause")
 
+    # ── Preflight checks ────────────────────────────────────────────
+
+    _DEPENDENCY_CHECKS: list[tuple[str, str, str, str]] = [
+        # (manifest_file, check_command, install_command, ecosystem_name)
+        ("package.json", "npm ls --depth=0", "npm install", "Node.js"),
+        ("yarn.lock", "yarn check --verify-tree", "yarn install", "Yarn"),
+        ("pnpm-lock.yaml", "pnpm ls --depth=0", "pnpm install", "pnpm"),
+        ("requirements.txt", "pip check", "pip install -r requirements.txt", "Python (pip)"),
+        ("pyproject.toml", "pip check", "pip install -e '.[dev]'  # or: pip install -e .", "Python"),
+        ("Cargo.toml", "cargo check --message-format=short 2>&1 | head -20", "cargo build", "Rust"),
+        ("Gemfile", "bundle check", "bundle install", "Ruby"),
+        ("go.mod", "go build ./... 2>&1 | head -20", "go mod download", "Go"),
+        ("composer.json", "composer check-platform-reqs", "composer install", "PHP"),
+    ]
+
+    def _preflight_dependency_check(self, run_id: str) -> RunOutcome | None:
+        """Check project dependencies are installed before starting tasks.
+
+        Detects the project type from manifest files and runs a lightweight
+        dependency check. If dependencies are missing, blocks with actionable
+        guidance rather than letting the executor fail repeatedly.
+        """
+        failures: list[tuple[str, str, str, str]] = []  # (ecosystem, check_cmd, install_cmd, stderr)
+
+        # Also check plan verification commands for basic runnability
+        seen_checks: set[str] = set()
+
+        for manifest, check_cmd, install_cmd, ecosystem in self._DEPENDENCY_CHECKS:
+            if not (self.repo_root / manifest).exists():
+                continue
+            if check_cmd in seen_checks:
+                continue
+            seen_checks.add(check_cmd)
+            try:
+                result = subprocess.run(
+                    ["bash", "-lc", check_cmd],
+                    cwd=self.repo_root,
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                    check=False,
+                )
+                if result.returncode != 0:
+                    error_output = (result.stderr or result.stdout or "").strip()
+                    # Truncate very long output
+                    if len(error_output) > 500:
+                        error_output = error_output[:500] + "\n... (truncated)"
+                    failures.append((ecosystem, check_cmd, install_cmd, error_output))
+            except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+                # Don't block on check failures — the check tool itself might
+                # not be installed, which is fine (e.g. cargo not installed for
+                # a non-Rust project that happens to have a Cargo.toml).
+                continue
+
+        if not failures:
+            self.events.log(
+                "preflight.passed",
+                data={"run_id": run_id, "checks_run": len(seen_checks)},
+            )
+            return None
+
+        # Build actionable human intervention payload
+        actions: list[str] = [
+            "Project dependency check failed. Install missing dependencies before resuming:",
+            "",
+        ]
+        for ecosystem, _check_cmd, install_cmd, error_output in failures:
+            actions.append(f"  {ecosystem}: run `{install_cmd}`")
+            if error_output:
+                # Show first 3 lines of error for context
+                error_lines = error_output.splitlines()[:3]
+                for line in error_lines:
+                    actions.append(f"    {line}")
+        actions.append("")
+        actions.append(f"Run `ralph resume --run-id {run_id}` once dependencies are installed.")
+
+        first_task_id = self.plan.tasks[0].id if self.plan.tasks else "TASK-001"
+        reason = make_human_intervention_payload(
+            summary="Missing project dependencies detected during preflight check.",
+            what_failed=(
+                f"Preflight dependency check failed for "
+                f"{', '.join(eco for eco, _, _, _ in failures)}. "
+                f"The executor will not be able to build or test the project until "
+                f"dependencies are installed."
+            ),
+            expected_human_actions=actions,
+            metadata={
+                "reason": "preflight_dependency_check",
+                "ecosystems_failed": [eco for eco, _, _, _ in failures],
+            },
+        )
+
+        record = self.store.get_task_state(run_id, first_task_id)
+        attempt_count = 0 if record is None else record.attempt_count
+        self._transition(
+            run_id,
+            first_task_id,
+            TaskState.BLOCKED_HUMAN,
+            attempt_count=attempt_count,
+            last_error=reason,
+        )
+        self.store.update_run_status(run_id, RunStatus.BLOCKED_HUMAN)
+        self.events.log(
+            "preflight.failed",
+            data={
+                "run_id": run_id,
+                "status": RunStatus.BLOCKED_HUMAN,
+                "reason": "Missing dependencies",
+                "ecosystems": [eco for eco, _, _, _ in failures],
+            },
+        )
+        return RunOutcome(
+            run_id=run_id,
+            status=RunStatus.BLOCKED_HUMAN,
+            reason="Missing project dependencies — install before resuming.",
+        )
+
     def _run_loop(self, run_id: str, *, task_limit: int | None = None) -> RunOutcome:
+        # Preflight: check project dependencies before starting any work
+        preflight_outcome = self._preflight_dependency_check(run_id)
+        if preflight_outcome is not None:
+            return preflight_outcome
+
         scheduler = Scheduler(self.plan, self.store, run_id)
         ratchet_manager = RatchetManager(
             overlay_dir=self._ensure_run_paths(run_id).overlays_dir,
@@ -458,10 +684,22 @@ class Orchestrator:
         prompt_path = run_paths.prompts_dir / f"{task.id}_attempt_{attempt_number}.md"
         prompt_path.write_text(prompt, encoding="utf-8")
 
+        executor_model = self._executor_model(attempt_number)
+        if self._is_auto_escalated_executor_model(attempt_number):
+            self.events.log(
+                "executor.auto_escalated",
+                task_id=task.id,
+                data={
+                    "run_id": run_id,
+                    "attempt": attempt_number,
+                    "from_model": self._base_executor_model(),
+                    "to_model": executor_model,
+                },
+            )
         self.events.log(
             "executor.started",
             task_id=task.id,
-            data={"run_id": run_id, "attempt": attempt_number},
+            data={"run_id": run_id, "attempt": attempt_number, "model": executor_model},
         )
         self._set_activity_sink(
             tracker=self.executor_activity_tracker,
@@ -476,19 +714,21 @@ class Orchestrator:
             run_id=run_id, task_id=task.id, attempt_number=attempt_number,
             provider=self._executor_provider(), role="executor", review_round=0,
             event_type=ProviderEventType.AGENT_STARTED,
+            payload={"model": executor_model},
         )
         executor_finished_emitted = False
         try:
-            result: ExecutorResult = self.executor.execute(
+            result = self._execute_with_model(
                 prompt,
                 timeout_seconds=self.config.timeouts.executor_call_seconds,
                 cwd=self.repo_root,
+                model=executor_model,
             )
             self.store.record_invocation(
                 run_id,
                 task.id,
                 role="executor",
-                model=self.config.models.executor,
+                model=executor_model,
                 input_tokens=result.input_tokens,
                 output_tokens=result.output_tokens,
                 duration_seconds=result.duration_seconds,
@@ -640,11 +880,7 @@ class Orchestrator:
             }
             for vr in verification_results
         ]
-        changed_snippets: dict[str, str] = {}
-        for fpath in task.expected_files:
-            full = self.repo_root / fpath
-            if full.exists():
-                changed_snippets[fpath] = full.read_text(encoding="utf-8").rstrip()
+        changed_snippets = collect_changed_file_snippets(self.repo_root, task.expected_files)
 
         first_pass_prompt = build_first_pass_prompt(
             task_id=task.id,
@@ -675,6 +911,7 @@ class Orchestrator:
             run_id=run_id, task_id=task.id, attempt_number=attempt_number,
             provider=self._reviewer_provider(), role="reviewer", review_round=1,
             event_type=ProviderEventType.AGENT_STARTED,
+            payload={"model": self._reviewer_model()},
         )
         reviewer_finished_emitted = False
         try:
@@ -816,13 +1053,15 @@ class Orchestrator:
             run_id=run_id, task_id=task.id, attempt_number=attempt_number,
             provider=self._executor_provider(), role="executor", review_round=2,
             event_type=ProviderEventType.AGENT_STARTED,
+            payload={"model": self._executor_model(attempt_number)},
         )
         challenge_exec_finished = False
         try:
-            exec_result: ExecutorResult = self.executor.execute(
+            exec_result = self._execute_with_model(
                 challenge_exec_prompt,
                 timeout_seconds=self.config.timeouts.executor_call_seconds,
                 cwd=self.repo_root,
+                model=self._executor_model(attempt_number),
             )
             self.store.record_invocation(
                 run_id,
@@ -897,10 +1136,7 @@ class Orchestrator:
         if self.reviewer_activity_tracker is not None:
             self.reviewer_activity_tracker.clear()
         # Update changed snippets
-        for fpath in task.expected_files:
-            full = self.repo_root / fpath
-            if full.exists():
-                changed_snippets[fpath] = full.read_text(encoding="utf-8").rstrip()
+        changed_snippets = collect_changed_file_snippets(self.repo_root, task.expected_files)
 
         vr_dicts = [
             {
@@ -941,6 +1177,7 @@ class Orchestrator:
             run_id=run_id, task_id=task.id, attempt_number=attempt_number,
             provider=self._reviewer_provider(), role="reviewer", review_round=2,
             event_type=ProviderEventType.AGENT_STARTED,
+            payload={"model": self._reviewer_model()},
         )
         challenge_reviewer_finished = False
         try:
@@ -1091,6 +1328,28 @@ class Orchestrator:
         else:
             new_commands = findings.new_verification_commands
 
+        # Detect recurring findings across attempts — if the same issues keep
+        # appearing, the executor likely can't fix them (e.g. missing system
+        # package) and the human should be notified early.
+        if attempt_number >= 2:
+            recurring = self._detect_recurring_findings(run_id, task, attempt_number, findings)
+            if recurring:
+                return self._escalate_to_human_environment(
+                    run_id, task, attempt_number, findings, recurring, diff_risk,
+                )
+
+            # Also detect recurring verification failures (same commands keep failing)
+            if findings.decision == "accept" and not all_verification_passed:
+                recurring_cmds = self._detect_recurring_verification_failures(
+                    run_id, task, attempt_number, verification_results,
+                )
+                if recurring_cmds:
+                    return self._escalate_to_human_environment(
+                        run_id, task, attempt_number, findings,
+                        [f"Verification keeps failing: {cmd}" for cmd in recurring_cmds],
+                        diff_risk,
+                    )
+
         ratchet_result = ratchet_manager.add_checks(task.id, new_commands)
         for command in ratchet_result.accepted:
             self.events.log(
@@ -1100,15 +1359,10 @@ class Orchestrator:
             )
 
         if attempt_number >= self.config.ralph.max_retries_per_task:
-            message = repair_notes or "Retry budget exhausted."
-            self._transition(
-                run_id,
-                task.id,
-                TaskState.FAILED_EXHAUSTED,
-                attempt_count=attempt_number,
-                last_error=message,
+            return self._handle_exhausted(
+                run_id, task, attempt_number, findings,
+                repair_notes, diff_risk,
             )
-            return None
 
         # Persist rejection count so it survives resume
         repair_payload = json.dumps({
@@ -1123,6 +1377,98 @@ class Orchestrator:
             last_error=repair_payload,
         )
         return None
+
+    def _handle_exhausted(
+        self,
+        run_id: str,
+        task: Task,
+        attempt_number: int,
+        findings: ReviewFindings,
+        repair_notes: str | None,
+        diff_risk: RiskLevel,
+    ) -> RunOutcome:
+        """Stop the run when a task exhausts its retry budget.
+
+        Reverts uncommitted changes from the failed task to prevent workspace
+        drift, and provides the operator with two clear resume options.
+        """
+        budget = self.config.ralph.max_retries_per_task
+
+        # Build a summary of what went wrong across attempts
+        summary_parts: list[str] = []
+        if repair_notes:
+            summary_parts.append(repair_notes)
+        if findings.findings:
+            summary_parts.append(f"Last review had {len(findings.findings)} finding(s):")
+            for f in findings.findings[:5]:
+                summary_parts.append(f"  {f.id} [{f.severity}] ({f.category}): {f.description}")
+
+        actions = [
+            f"Task {task.id} failed after {attempt_number}/{budget} attempts.",
+            "",
+            "Option 1 — Discard changes and restart from scratch (default):",
+            f"  ralph resume --run-id {run_id}",
+            "  This reverts all uncommitted changes and re-implements the task from attempt 0.",
+            "",
+            "Option 2 — Increase retry budget and continue from current state:",
+            f"  ralph resume --run-id {run_id} --max-retries {budget + 3}",
+            "  This keeps the current code and gives the executor more attempts.",
+        ]
+
+        reason = make_human_intervention_payload(
+            summary=f"Retry budget exhausted for {task.id} after {attempt_number} attempts.",
+            what_failed="\n".join(summary_parts) if summary_parts else "Retry budget exhausted.",
+            expected_human_actions=actions,
+            findings=[
+                {
+                    "id": f.id,
+                    "severity": str(f.severity),
+                    "category": str(f.category),
+                    "description": f.description,
+                    "suggested_fix": f.suggested_fix,
+                    "verification_command": f.verification_command,
+                }
+                for f in findings.findings
+            ],
+            metadata={
+                "task_id": task.id,
+                "risk": str(diff_risk),
+                "attempt_count": attempt_number,
+                "max_retries": budget,
+                "escalation_reason": "retry_budget_exhausted",
+            },
+        )
+
+        self._transition(
+            run_id,
+            task.id,
+            TaskState.FAILED_EXHAUSTED,
+            attempt_count=attempt_number,
+            last_error=reason,
+        )
+
+        # Revert uncommitted changes from the failed task to prevent
+        # workspace drift errors on subsequent tasks.
+        if not self.git_manager.is_clean():
+            self.git_manager.reset_to_head_clean()
+
+        self.store.update_run_status(run_id, RunStatus.BLOCKED_HUMAN)
+        self.events.log(
+            "run.stopped",
+            task_id=task.id,
+            data={
+                "run_id": run_id,
+                "status": RunStatus.BLOCKED_HUMAN,
+                "reason": f"Retry budget exhausted for {task.id}.",
+                "attempt_count": attempt_number,
+                "max_retries": budget,
+            },
+        )
+        return RunOutcome(
+            run_id=run_id,
+            status=RunStatus.BLOCKED_HUMAN,
+            reason=f"Retry budget exhausted for {task.id} after {attempt_number} attempts.",
+        )
 
     def _escalate_to_human(
         self,
@@ -1203,10 +1549,229 @@ class Orchestrator:
             reason=f"Adversarial review escalation for {task.id}.",
         )
 
-    def _executor_model(self) -> str:
+    def _detect_recurring_findings(
+        self,
+        run_id: str,
+        task: Task,
+        attempt_number: int,
+        current_findings: ReviewFindings,
+    ) -> list[str] | None:
+        """Detect findings that recur across attempts.
+
+        Returns a list of recurring finding descriptions if the same issues
+        keep appearing (indicating the executor cannot fix them, e.g. a missing
+        system package or environmental dependency). Returns None if no
+        recurring pattern is detected.
+        """
+        run_paths = self._ensure_run_paths(run_id)
+
+        # Collect finding signatures from previous attempts
+        past_signatures: dict[str, int] = {}  # normalized description → count
+        for prev_attempt in range(1, attempt_number):
+            for round_num in (1, 2):
+                review_file = run_paths.reviews_dir / f"{task.id}_attempt_{prev_attempt}_round{round_num}.json"
+                if not review_file.exists():
+                    continue
+                try:
+                    payload = json.loads(review_file.read_text(encoding="utf-8"))
+                    findings_data = payload.get("findings")
+                    if not isinstance(findings_data, dict):
+                        continue
+                    for f in findings_data.get("findings", []):
+                        if not isinstance(f, dict):
+                            continue
+                        desc = str(f.get("description", "")).strip().lower()
+                        cat = str(f.get("category", ""))
+                        sig = f"{cat}:{desc[:80]}"
+                        past_signatures[sig] = past_signatures.get(sig, 0) + 1
+                except (OSError, ValueError, json.JSONDecodeError):
+                    continue
+
+        if not past_signatures:
+            return None
+
+        # Check current findings against past signatures
+        recurring: list[str] = []
+        for finding in current_findings.findings:
+            desc = finding.description.strip().lower()
+            cat = str(finding.category)
+            sig = f"{cat}:{desc[:80]}"
+            if past_signatures.get(sig, 0) >= 1:
+                recurring.append(finding.description)
+
+        # Only flag if a meaningful proportion of findings are recurring
+        if len(recurring) >= 1 and len(recurring) >= len(current_findings.findings) * 0.5:
+            return recurring
+        return None
+
+    def _detect_recurring_verification_failures(
+        self,
+        run_id: str,
+        task: Task,
+        attempt_number: int,
+        current_results: list,
+    ) -> list[str] | None:
+        """Detect verification commands that keep failing across attempts."""
+        current_failed = set()
+        for item in current_results:
+            success = getattr(item, "success", item.get("success", False) if isinstance(item, dict) else False)
+            if not success:
+                cmd = getattr(item, "command", item.get("command", "?") if isinstance(item, dict) else "?")
+                current_failed.add(cmd)
+
+        if not current_failed:
+            return None
+
+        # Check past verification events
+        past_failed: dict[str, int] = {}
+        for event in self.events.read_events():
+            if event.data.get("run_id") != run_id:
+                continue
+            if event.task_id != task.id:
+                continue
+            if event.event_type != "verification.result":
+                continue
+            past_attempt = event.data.get("attempt", 0)
+            if past_attempt >= attempt_number:
+                continue
+            if not event.data.get("success"):
+                cmd = event.data.get("command", "?")
+                past_failed[cmd] = past_failed.get(cmd, 0) + 1
+
+        recurring = [cmd for cmd in current_failed if past_failed.get(cmd, 0) >= 1]
+        return recurring if recurring else None
+
+    def _escalate_to_human_environment(
+        self,
+        run_id: str,
+        task: Task,
+        attempt_number: int,
+        findings: ReviewFindings,
+        recurring_descriptions: list[str],
+        diff_risk: RiskLevel,
+    ) -> RunOutcome:
+        """Escalate to human when findings recur across attempts.
+
+        This typically indicates an environmental issue the executor cannot fix
+        (missing package, system dependency, configuration issue).
+        """
+        actions: list[str] = [
+            "The following issues keep appearing across multiple attempts, suggesting "
+            "the executor cannot resolve them autonomously:",
+        ]
+        for desc in recurring_descriptions[:5]:
+            actions.append(f"  - {desc}")
+        actions.append("")
+        actions.append("Likely actions needed:")
+
+        # Detect common patterns and suggest specific actions
+        combined = " ".join(recurring_descriptions).lower()
+        if any(kw in combined for kw in ("package", "module", "import", "install", "not found", "no module")):
+            actions.append("- Install the missing package (e.g. `pip install <pkg>`, `npm install <pkg>`, `apt install <pkg>`)")
+        if any(kw in combined for kw in ("permission", "access denied", "forbidden")):
+            actions.append("- Fix file or service permissions")
+        if any(kw in combined for kw in ("config", "environment", "env var", "variable")):
+            actions.append("- Set the required environment variable or configuration")
+        if any(kw in combined for kw in ("test", "verification", "assertion")):
+            actions.append("- Review and fix the failing test or verification command")
+
+        actions.append(f"- Run `ralph resume --run-id {run_id}` once the environment is ready.")
+
+        reason = make_human_intervention_payload(
+            summary=f"Recurring issues detected for {task.id} — likely environmental.",
+            what_failed=(
+                f"The same finding(s) appeared across {attempt_number} attempts, "
+                f"indicating the executor cannot resolve them. "
+                f"This usually means a missing dependency or environmental issue."
+            ),
+            expected_human_actions=actions,
+            findings=[
+                {
+                    "id": f.id,
+                    "severity": str(f.severity),
+                    "category": str(f.category),
+                    "description": f.description,
+                    "suggested_fix": f.suggested_fix,
+                    "verification_command": f.verification_command,
+                }
+                for f in findings.findings
+            ],
+            metadata={
+                "task_id": task.id,
+                "risk": str(diff_risk),
+                "recurring_findings": recurring_descriptions,
+                "escalation_reason": "recurring_findings",
+            },
+        )
+        self._transition(
+            run_id,
+            task.id,
+            TaskState.BLOCKED_HUMAN,
+            attempt_count=attempt_number,
+            last_error=reason,
+        )
+        self.store.update_run_status(run_id, RunStatus.BLOCKED_HUMAN)
+        self.events.log(
+            "review.escalated",
+            task_id=task.id,
+            data={
+                "run_id": run_id,
+                "attempt": attempt_number,
+                "risk": diff_risk,
+                "reason": "recurring_findings",
+                "recurring_count": len(recurring_descriptions),
+            },
+        )
+        return RunOutcome(
+            run_id=run_id,
+            status=RunStatus.BLOCKED_HUMAN,
+            reason=f"Recurring unresolvable findings for {task.id} — human intervention needed.",
+        )
+
+    def _base_executor_model(self) -> str:
         if self.config.roles is not None:
             return self.config.roles.executor.model
         return self.config.models.executor
+
+    def _executor_model(self, attempt_number: int | None = None) -> str:
+        base_model = self._base_executor_model()
+        if attempt_number is None or not self._is_auto_escalated_executor_model(attempt_number):
+            return base_model
+        return self.config.ralph.auto_escalate_model
+
+    def _is_auto_escalated_executor_model(self, attempt_number: int) -> bool:
+        threshold = self.config.ralph.auto_escalate
+        if threshold is None:
+            return False
+        if attempt_number < threshold:
+            return False
+        return self.config.ralph.auto_escalate_model != self._base_executor_model()
+
+    def _execute_with_model(
+        self,
+        prompt: str,
+        *,
+        timeout_seconds: int | float,
+        cwd: str | Path | None,
+        model: str,
+    ) -> ExecutorResult:
+        transport = getattr(self.executor, "transport", None)
+        original_model = getattr(transport, "model", None)
+        if isinstance(original_model, str):
+            transport.model = model
+            try:
+                return self.executor.execute(
+                    prompt,
+                    timeout_seconds=timeout_seconds,
+                    cwd=cwd,
+                )
+            finally:
+                transport.model = original_model
+        return self.executor.execute(
+            prompt,
+            timeout_seconds=timeout_seconds,
+            cwd=cwd,
+        )
 
     def _reviewer_model(self) -> str:
         if self.config.roles is not None:

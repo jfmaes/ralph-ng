@@ -115,3 +115,14 @@ class TestProviderEventStore:
         assert events[0].review_round == 2
         assert events[0].provider == "codex"
         assert events[0].role == "reviewer"
+
+    def test_tolerates_invalid_utf8_bytes(self, tmp_path: Path) -> None:
+        store = ProviderEventStore(tmp_path)
+        store.log(_make_event())
+
+        path = tmp_path / "runs" / "run-1" / "task-1" / "attempt_1" / "provider_events.jsonl"
+        with path.open("ab") as fh:
+            fh.write(b"\x89PNG\r\n")
+
+        events = store.read_events("run-1", "task-1", 1)
+        assert len(events) == 1

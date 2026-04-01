@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 from pathlib import Path
+import json
 import os
 import secrets
 import signal
@@ -43,6 +44,21 @@ _active_orchestrator: Orchestrator | None = None
 _active_run_id: str | None = None
 _sigint_count = 0
 _sigint_lock = threading.Lock()
+
+
+def _cleanup_dirty_workspace(repo_root: Path, console: Console) -> None:
+    """Reset uncommitted changes left by a dead/paused run."""
+    status = subprocess.run(
+        ["git", "status", "--porcelain"],
+        cwd=repo_root,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if status.returncode == 0 and status.stdout.strip():
+        console.print("[yellow]Cleaning up uncommitted changes from stale run...[/yellow]")
+        subprocess.run(["git", "reset", "--hard", "HEAD"], cwd=repo_root, capture_output=True, check=False)
+        subprocess.run(["git", "clean", "-fd"], cwd=repo_root, capture_output=True, check=False)
 
 
 app = typer.Typer(
@@ -436,6 +452,9 @@ def start_command(
                         store.update_run_status(resumable_run.id, "paused")
                         store.release_controller(resumable_run.id, stop_reason='{"cause": "stale", "detail": "Superseded by new run"}')
                         console.print(f"[yellow]Marked stale run {resumable_run.id} as paused.[/yellow]")
+                        # Clean up any uncommitted changes left by the dead run.
+                        # These will be re-attempted when the stale run is resumed.
+                        _cleanup_dirty_workspace(repo_root, console)
                     else:
                         raise ValueError(
                             "A previous run is still resumable. "
@@ -506,6 +525,12 @@ def resume_command(
         min=1,
         help="Stop cleanly after this many tasks reach done during this invocation.",
     ),
+    max_retries: int | None = typer.Option(
+        None,
+        "--max-retries",
+        min=1,
+        help="Increase max retries per task. Exhausted tasks continue from current attempt instead of restarting.",
+    ),
 ) -> None:
     """Resume a previous run."""
 
@@ -564,7 +589,7 @@ def resume_command(
             prev_handlers = _install_signal_handlers(orchestrator)
             try:
                 outcome = run_with_progress(
-                    lambda: orchestrator.resume(run_id=run_id, task_limit=number_of_tasks),
+                    lambda: orchestrator.resume(run_id=run_id, task_limit=number_of_tasks, max_retries=max_retries),
                     run_id=run_id,
                     plan=plan,
                     config=loaded_config,

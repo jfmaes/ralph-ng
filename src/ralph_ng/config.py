@@ -17,8 +17,10 @@ class RalphSection(BaseModel):
 
     branch_prefix: str = "ralph/"
     auto_push: bool = False
-    max_retries_per_task: int = Field(default=3, ge=1)
+    max_retries_per_task: int = Field(default=5, ge=1)
     max_ratchet_checks_per_task: int = Field(default=10, ge=1)
+    auto_escalate: int | None = Field(default=None, ge=1)
+    auto_escalate_model: str = "opus"
 
     @field_validator("branch_prefix")
     @classmethod
@@ -27,13 +29,20 @@ class RalphSection(BaseModel):
             raise ValueError("branch_prefix must not be empty")
         return value
 
+    @field_validator("auto_escalate_model")
+    @classmethod
+    def validate_auto_escalate_model(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("auto_escalate_model must not be empty")
+        return value
+
 
 class ModelsConfig(BaseModel):
     """Legacy model config — used as fallback when [roles] is absent."""
 
     model_config = ConfigDict(extra="forbid")
 
-    executor: str = "sonnet"
+    executor: str = "opus"
     cli: str = "claude"
 
     @field_validator("executor", "cli")
@@ -82,7 +91,7 @@ class RoleConfig(BaseModel):
 
     provider: str = "claude"
     transport: str = "cli"  # "cli" now, "api" in v0.3
-    model: str = "sonnet"
+    model: str = "opus"
     cli_path: str = "claude"
     reasoning_effort: str | None = None
     service_tier: str | None = None
@@ -122,7 +131,7 @@ class RolesConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     executor: RoleConfig = Field(default_factory=lambda: RoleConfig(
-        provider="claude", model="sonnet", cli_path="claude",
+        provider="claude", model="opus", cli_path="claude",
     ))
     reviewer: RoleConfig = Field(default_factory=lambda: RoleConfig(
         provider="codex",

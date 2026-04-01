@@ -4,10 +4,23 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ralph-ng"
-version = "0.1.0"
+dynamic = ["version"]
 description = "Local autonomous coding orchestrator"
-readme = "spec.md"
+readme = {file = "README.md", content-type = "text/markdown"}
 requires-python = ">=3.12"
+authors = [
+  {name = "jfmaes", email = "jeanfrancoismaes.limited@gmail.com"},
+]
+license = "MIT"
+license-files = ["LICENSE"]
+keywords = ["ai", "autonomous-coding", "cli", "orchestrator", "review"]
+classifiers = [
+  "Environment :: Console",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.12",
+  "Topic :: Software Development",
+  "Topic :: Software Development :: Quality Assurance",
+]
 dependencies = [
   "pydantic>=2.8,<3",
   "PyYAML>=6.0,<7",
@@ -15,6 +28,11 @@ dependencies = [
   "textual>=0.89,<1",
   "typer>=0.12,<1",
 ]
+
+[project.urls]
+Homepage = "https://github.com/jfmaes/ralph-ng"
+Repository = "https://github.com/jfmaes/ralph-ng"
+Issues = "https://github.com/jfmaes/ralph-ng/issues"
 
 [project.optional-dependencies]
 dev = [
@@ -27,6 +45,9 @@ ralph = "ralph_ng.cli:app"
 
 [tool.setuptools]
 package-dir = {"" = "src"}
+
+[tool.setuptools.dynamic]
+version = {attr = "ralph_ng.__version__"}
 
 [tool.setuptools.packages.find]
 where = ["src"]

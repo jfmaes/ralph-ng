@@ -44,3 +44,16 @@ def test_event_reader_skips_corrupt_lines(tmp_path: Path) -> None:
 
     assert len(events) == 1
     assert events[0].event_type == "run.started"
+
+
+def test_event_reader_tolerates_invalid_utf8_bytes(tmp_path: Path) -> None:
+    path = tmp_path / "events.jsonl"
+    path.write_bytes(
+        b'{"timestamp":"t","event_type":"run.started","task_id":null,"data":{}}\n'
+        b'\x89PNG\r\n'
+    )
+
+    events = EventLogger(path).read_events()
+
+    assert len(events) == 1
+    assert events[0].event_type == "run.started"

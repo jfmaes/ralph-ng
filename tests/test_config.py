@@ -10,6 +10,8 @@ def test_loads_valid_config(fixtures_dir: Path) -> None:
 
     assert config.ralph.branch_prefix == "ralph/test/"
     assert config.ralph.auto_push is True
+    assert config.ralph.auto_escalate == 4
+    assert config.ralph.auto_escalate_model == "opus"
     assert config.models.executor == "haiku"
     assert config.models.cli == "claude"
     assert config.timeouts.executor_call_seconds == 900
@@ -21,7 +23,10 @@ def test_applies_defaults_for_omitted_sections(fixtures_dir: Path) -> None:
 
     assert config.ralph.branch_prefix == "ralph/"
     assert config.ralph.auto_push is False
-    assert config.models.executor == "sonnet"
+    assert config.ralph.max_retries_per_task == 5
+    assert config.ralph.auto_escalate is None
+    assert config.ralph.auto_escalate_model == "opus"
+    assert config.models.executor == "opus"
     assert config.timeouts.verification_command_seconds == 120
     assert config.git.force_push is False
 
@@ -29,7 +34,10 @@ def test_applies_defaults_for_omitted_sections(fixtures_dir: Path) -> None:
 def test_missing_config_file_returns_defaults(tmp_path: Path) -> None:
     config = load_config(tmp_path / "missing.toml")
 
-    assert config.models.executor == "sonnet"
+    assert config.ralph.max_retries_per_task == 5
+    assert config.ralph.auto_escalate is None
+    assert config.ralph.auto_escalate_model == "opus"
+    assert config.models.executor == "opus"
     assert config.git.protected_branches == ["main", "master"]
 
 

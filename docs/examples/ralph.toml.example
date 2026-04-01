@@ -1,11 +1,14 @@
 [ralph]
 branch_prefix = "ralph/"
 auto_push = false
-max_retries_per_task = 3
+max_retries_per_task = 5
 max_ratchet_checks_per_task = 10
+# Use only if your default executor is a less capable model.
+# auto_escalate = 4
+auto_escalate_model = "opus"
 
 [models]
-executor = "sonnet"
+executor = "opus"
 cli = "claude"
 
 [timeouts]

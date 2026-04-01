@@ -47,6 +47,9 @@ class CliCodexTransport(Transport):
         self._text_buffer: list[str] = []
         self._thought_counter = 0
         self._current_thought_id: str | None = None
+        # Track unhandled event types for diagnostics
+        self._seen_event_types: set[str] = set()
+        self._handled_event_types: set[str] = set()
 
     def invoke(
         self,
@@ -56,7 +59,7 @@ class CliCodexTransport(Transport):
         cwd: str | None = None,
         json_schema: dict[str, Any] | None = None,
     ) -> TransportResult:
-        command, schema_path = self._build_command(prompt, json_schema)
+        command, schema_path, prompt_path = self._build_command(prompt, json_schema)
         workdir = str(Path(cwd)) if cwd is not None else None
 
         # Accumulated state from streaming
@@ -65,6 +68,7 @@ class CliCodexTransport(Transport):
         output_tokens = 0
         error_message: str | None = None
         events: list[dict[str, Any]] = []
+        unexpected_lines: list[str] = []
 
         def _on_line(raw_line: str) -> None:
             nonlocal input_tokens, output_tokens, error_message
@@ -75,9 +79,13 @@ class CliCodexTransport(Transport):
             try:
                 event = json.loads(line)
             except json.JSONDecodeError:
+                unexpected_lines.append(line)
+                self._report_unexpected_output(line)
                 return  # tolerate partial/corrupt lines
 
             if not isinstance(event, dict):
+                unexpected_lines.append(line)
+                self._report_unexpected_output(line)
                 return
 
             events.append(event)
@@ -108,11 +116,17 @@ class CliCodexTransport(Transport):
 
             # Extract tool activity for live tracker
             if self.tracker is not None:
-                self._extract_activity(event)
+                try:
+                    self._extract_activity(event)
+                except Exception as exc:
+                    self._report_tracker_error(exc, event_type)
 
             # Emit raw event for persistence
             if self._on_event is not None:
-                self._on_event(event)
+                try:
+                    self._on_event(event)
+                except Exception as exc:
+                    self._report_tracker_error(exc, f"persist {event_type}")
 
         started_at = time.monotonic()
         try:
@@ -120,18 +134,22 @@ class CliCodexTransport(Transport):
                 command,
                 cwd=workdir,
                 timeout_seconds=timeout_seconds,
+                stdin_path=prompt_path,
                 on_line=_on_line,
                 cancel_event=self.cancel_event,
             )
         finally:
-            if schema_path is not None:
+            for path in (schema_path, prompt_path):
+                if path is None:
+                    continue
                 try:
-                    os.unlink(schema_path)
+                    os.unlink(path)
                 except OSError:
                     pass
         # Flush any remaining buffered text after stream ends
         if self.tracker is not None:
             self._flush_text_buffer(final=True)
+            self._emit_unhandled_diagnostics()
         duration = time.monotonic() - started_at
 
         if stream_result.timed_out:
@@ -178,9 +196,9 @@ class CliCodexTransport(Transport):
         if not text_parts and not events:
             return TransportResult(
                 status=InvocationStatus.MALFORMED_OUTPUT,
-                output_text="",
+                output_text="\n".join(unexpected_lines),
                 duration_seconds=duration,
-                error_message="Codex produced no parseable output",
+                error_message="Codex produced no parseable JSON output",
                 exit_status=stream_result.returncode,
                 stderr_text=stream_result.stderr_text,
                 raw_events=events,
@@ -201,6 +219,20 @@ class CliCodexTransport(Transport):
         """Check if the codex CLI is available on PATH."""
         return shutil.which(self.cli_path) is not None
 
+    def _emit_unhandled_diagnostics(self) -> None:
+        """Emit a diagnostic if we saw event types we didn't handle."""
+        unhandled = self._seen_event_types - self._handled_event_types
+        # Ignore types that are intentionally unhandled (usage-only, etc.)
+        unhandled.discard("")
+        if unhandled and self.tracker is not None:
+            types_str = ", ".join(sorted(unhandled))
+            self.tracker.push(make_activity(
+                ActivityKind.PROGRESS,
+                f"unhandled codex event types: {types_str[:120]}",
+            ))
+        self._seen_event_types.clear()
+        self._handled_event_types.clear()
+
     def _start_thought(self) -> None:
         self._thought_counter += 1
         self._current_thought_id = f"codex-thought-{self._thought_counter}"
@@ -209,6 +241,8 @@ class CliCodexTransport(Transport):
         """Extract reasoning and tool activity from a Codex JSONL event."""
         assert self.tracker is not None
         event_type = event.get("type", "")
+        self._seen_event_types.add(event_type)
+        matched = True
 
         if event_type == "thread.started":
             self._flush_text_buffer(final=True)
@@ -274,9 +308,44 @@ class CliCodexTransport(Transport):
                                 self._push_reasoning(text, final=True, force_new=True)
                                 emitted_reasoning = True
                 if not emitted_reasoning:
+                    text = item.get("text", "")
+                    if isinstance(text, str) and text.strip():
+                        if self._looks_like_json(text):
+                            self.tracker.push(make_activity(
+                                ActivityKind.RESULT,
+                                self._summarize_structured_message(text),
+                                text=self._summarize_structured_message(text),
+                            ))
+                        else:
+                            self._push_reasoning(text, final=True, force_new=True)
+                            emitted_reasoning = True
+                if not emitted_reasoning:
                     self.tracker.push(make_activity(ActivityKind.RESULT, "structured review output received"))
 
-        # Streaming message deltas (reasoning text as it arrives)
+        # Streaming reasoning summaries (gpt-5.x reasoning models)
+        elif event_type == "response.reasoning_summary_text.delta":
+            delta = event.get("delta", "")
+            if isinstance(delta, str) and delta:
+                self._text_buffer.append(delta)
+                if "\n" in delta:
+                    self._flush_text_buffer()
+                else:
+                    buffered = "".join(self._text_buffer)
+                    if len(buffered) >= 40:
+                        self._flush_text_buffer()
+
+        elif event_type == "response.reasoning_summary_text.done":
+            self._flush_text_buffer(final=True)
+
+        elif event_type in (
+            "response.reasoning_summary_part.added",
+            "response.reasoning_summary_part.done",
+        ):
+            text = event.get("part", {}).get("text", "") if isinstance(event.get("part"), dict) else ""
+            if text:
+                self._push_reasoning(text, final=True, force_new=True)
+
+        # Streaming message deltas (output text as it arrives)
         elif event_type == "response.output_text.delta":
             delta = event.get("delta", "")
             if isinstance(delta, str) and not self._looks_like_json(delta):
@@ -286,7 +355,18 @@ class CliCodexTransport(Transport):
                     self._flush_text_buffer()
                 else:
                     buffered = "".join(self._text_buffer)
-                    if len(buffered) >= 120:
+                    if len(buffered) >= 40:
+                        self._flush_text_buffer()
+
+        # Incremental item content (alternative streaming path)
+        elif event_type == "item.streaming":
+            item = event.get("item", {})
+            if isinstance(item, dict):
+                item_type = item.get("type", "")
+                if item_type == "reasoning":
+                    text = item.get("text", "") or item.get("summary", "")
+                    if text:
+                        self._text_buffer.append(text)
                         self._flush_text_buffer()
 
         elif event_type == "response.output_item.done":
@@ -303,6 +383,12 @@ class CliCodexTransport(Transport):
                 ActivityKind.ERROR,
                 f"Error: {msg[:80]}",
             ))
+
+        else:
+            matched = False
+
+        if matched:
+            self._handled_event_types.add(event_type)
 
         usage = event.get("usage")
         if isinstance(usage, dict):
@@ -378,11 +464,49 @@ class CliCodexTransport(Transport):
             return f"{value / 1_000:.1f}K"
         return str(value)
 
+    def _report_unexpected_output(self, line: str) -> None:
+        if self.tracker is not None:
+            snippet = line[:160]
+            self.tracker.push(make_activity(
+                ActivityKind.PROGRESS,
+                f"unexpected codex output: {snippet}",
+                text=f"unexpected codex output: {snippet}",
+            ))
+
+    def _report_tracker_error(self, exc: Exception, context: str) -> None:
+        if self.tracker is not None:
+            self.tracker.push(make_activity(
+                ActivityKind.ERROR,
+                f"codex stream handling error ({context}): {exc}",
+                text=f"codex stream handling error ({context}): {exc}",
+            ))
+
+    @staticmethod
+    def _summarize_structured_message(text: str) -> str:
+        try:
+            payload = json.loads(text)
+        except json.JSONDecodeError:
+            return "structured review output received"
+        if not isinstance(payload, dict):
+            return "structured review output received"
+        decision = str(payload.get("decision", "")).strip()
+        summary = str(payload.get("summary", "")).strip()
+        confidence = payload.get("confidence")
+        parts: list[str] = []
+        if decision:
+            if isinstance(confidence, (int, float)):
+                parts.append(f"{decision} ({confidence:.2f})")
+            else:
+                parts.append(decision)
+        if summary:
+            parts.append(summary)
+        return " - ".join(parts) if parts else "structured review output received"
+
     def _build_command(
         self,
         prompt: str,
         json_schema: dict[str, Any] | None,
-    ) -> tuple[list[str], str | None]:
+    ) -> tuple[list[str], str | None, str]:
         cmd = [
             self.cli_path,
             "exec",
@@ -390,8 +514,17 @@ class CliCodexTransport(Transport):
             "--model", self.model,
             "--skip-git-repo-check",
             "--yolo",
-            prompt,
+            "-",
         ]
+        prompt_file = tempfile.NamedTemporaryFile(
+            mode="w",
+            suffix=".txt",
+            delete=False,
+            encoding="utf-8",
+        )
+        prompt_file.write(prompt)
+        prompt_file.close()
+        prompt_path = prompt_file.name
         schema_path: str | None = None
         if json_schema is not None:
             schema_file = tempfile.NamedTemporaryFile(
@@ -409,4 +542,4 @@ class CliCodexTransport(Transport):
             cmd[1:1] = ["-c", f"model_reasoning_effort={json.dumps(self.reasoning_effort)}"]
         if self.service_tier is not None:
             cmd[1:1] = ["-c", f"service_tier={json.dumps(self.service_tier)}"]
-        return cmd, schema_path
+        return cmd, schema_path, prompt_path

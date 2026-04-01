@@ -408,6 +408,9 @@ class ProgressRenderer:
             "  ",
             (f"execution attempt {current_task.attempt_count}/{budget}", "dim"),
         ))
+        active_role_line = self._active_role_focus_line()
+        if active_role_line is not None:
+            lines.append(active_role_line)
 
         verification_events = self._verification_events(run_id, current_task, run_events)
         if verification_events:
@@ -450,13 +453,17 @@ class ProgressRenderer:
             ))
 
         review_summary, review_findings = self._latest_review_summary(current_task)
+        challenge_pending = self._review_challenge_pending(run_id, current_task)
         if review_summary:
-            lines.append(Text.assemble(
-                ("review verdict: ", "bold"),
-                (review_summary, "yellow" if review_findings else "green"),
-            ))
-        for finding_line in review_findings[:3]:
-            lines.append(Text(f"  {finding_line}", style="red"))
+            finding_count = f"  ({len(review_findings)} findings)" if review_findings else ""
+            verdict = Text.assemble(
+                ("first-pass verdict: " if challenge_pending else "review verdict: ", "bold"),
+                (review_summary, "yellow" if (review_findings or challenge_pending) else "green"),
+                (finding_count, "dim"),
+            )
+            if challenge_pending:
+                verdict.append("  challenge pending", style="bold yellow")
+            lines.append(verdict)
 
         last_event = self._latest_task_event(
             run_events,
@@ -475,6 +482,35 @@ class ProgressRenderer:
             ))
 
         return Panel(Text("\n").join(lines), title="Current Task", title_align="left")
+
+    def _active_role_focus_line(self) -> Text | None:
+        if self.executor_activity.active:
+            elapsed = self._format_clock_duration(self._activity_elapsed_seconds(self.executor_activity))
+            provider_label = self.executor_activity.provider or "executor"
+            model_label = f"/{self.executor_activity.model}" if self.executor_activity.model else ""
+            return Text.assemble(
+                ("executor running for ", "bold"),
+                (elapsed, self._timeout_style(self.executor_activity, "executor")),
+                "  ",
+                (f"({provider_label}{model_label})", "dim"),
+            )
+        if self.reviewer_activity.active:
+            elapsed = self._format_clock_duration(self._activity_elapsed_seconds(self.reviewer_activity))
+            provider_label = self.reviewer_activity.provider or "reviewer"
+            model_label = f"/{self.reviewer_activity.model}" if self.reviewer_activity.model else ""
+            round_label = (
+                f"  round {self.reviewer_activity.review_round}"
+                if self.reviewer_activity.review_round > 0
+                else ""
+            )
+            return Text.assemble(
+                ("reviewer running for ", "bold"),
+                (elapsed, self._timeout_style(self.reviewer_activity, "reviewer")),
+                "  ",
+                (f"({provider_label}{model_label})", "dim"),
+                (round_label, "cyan"),
+            )
+        return None
 
     # ── Live activity ─────────────────────────────────────────────────
 
@@ -678,6 +714,9 @@ class ProgressRenderer:
                     target.role = event.role
                     target.review_round = event.review_round
                     target.started_at = event.timestamp
+                    model = str(event.payload.get("model", "")).strip()
+                    if model:
+                        target.model = model
                     if event.role == "executor":
                         target.current_action = "repairing (challenge)" if event.review_round > 0 else "executing"
                     else:
@@ -708,8 +747,10 @@ class ProgressRenderer:
                 )
             # Fill model from config
             if self.config.roles:
-                self.executor_activity.model = self.config.roles.executor.model
-                self.reviewer_activity.model = self.config.roles.reviewer.model
+                if not self.executor_activity.model:
+                    self.executor_activity.model = self.config.roles.executor.model
+                if not self.reviewer_activity.model:
+                    self.reviewer_activity.model = self.config.roles.reviewer.model
             return
 
         # Fallback: business events
@@ -868,6 +909,36 @@ class ProgressRenderer:
                     rendered_findings.append(f"{fid} [{severity}] ({category}): {description}")
         return summary or summary_text or None, rendered_findings
 
+    @staticmethod
+    def _review_round_from_path(path: Path) -> int | None:
+        name = path.name
+        if "_round1" in name:
+            return 1
+        if "_round2" in name:
+            return 2
+        return None
+
+    def _review_challenge_pending(self, run_id: str, current_task: TaskStateRecord) -> bool:
+        attempt = self.store.get_latest_attempt(current_task.run_id, current_task.task_id)
+        if attempt is None or attempt.review_path is None:
+            return False
+        if self._review_round_from_path(Path(attempt.review_path)) != 1:
+            return False
+        row = self.store.connection.execute(
+            "SELECT phase_checkpoint FROM runs WHERE id = ?",
+            (run_id,),
+        ).fetchone()
+        if row is None:
+            return False
+        checkpoint = row["phase_checkpoint"]
+        if not isinstance(checkpoint, str):
+            return False
+        prefixes = (
+            f"challenge_executor:{current_task.task_id}:attempt:{current_task.attempt_count}",
+            f"challenge_reviewer:{current_task.task_id}:attempt:{current_task.attempt_count}",
+        )
+        return checkpoint.startswith(prefixes)
+
     def _controller_problem(self, run_id: str) -> tuple[int, bool] | None:
         row = self.store.connection.execute(
             "SELECT controller_pid, last_heartbeat_at FROM runs WHERE id = ?",
@@ -932,13 +1003,16 @@ class ProgressRenderer:
         return "cyan"
 
     def _elapsed_label(self, activity: ProviderActivity, role: str) -> str:
-        elapsed = (
-            self._elapsed_since(activity.started_at)
-            if activity.started_at
-            else f"{activity.elapsed_seconds:.0f}s"
-        )
+        elapsed_seconds = self._activity_elapsed_seconds(activity)
         budget = self.config.timeouts.executor_call_seconds if role == "executor" else self.config.timeouts.reviewer_call_seconds
-        return f"{elapsed}/{self._format_duration_seconds(budget)}"
+        return f"running for {self._format_clock_duration(elapsed_seconds)} / {self._format_clock_duration(budget)}"
+
+    def _activity_elapsed_seconds(self, activity: ProviderActivity) -> int:
+        if activity.started_at:
+            elapsed = self._seconds_since(activity.started_at)
+            if elapsed is not None:
+                return elapsed
+        return max(int(activity.elapsed_seconds), 0)
 
     @staticmethod
     def _seconds_since(iso_timestamp: str) -> int | None:
@@ -984,6 +1058,15 @@ class ProgressRenderer:
         if hours > 0:
             return f"{hours}h{minutes:02d}m"
         return f"{minutes}m{seconds:02d}s"
+
+    @staticmethod
+    def _format_clock_duration(total_seconds: int | float) -> str:
+        total = max(int(total_seconds), 0)
+        minutes, seconds = divmod(total, 60)
+        hours, minutes = divmod(minutes, 60)
+        if hours > 0:
+            return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+        return f"{minutes:02d}:{seconds:02d}"
 
     @staticmethod
     def _humanize_error(raw: str, max_len: int = 200) -> str:

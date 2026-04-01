@@ -354,7 +354,12 @@ def test_doctor_reports_failure_and_recommendation(tmp_path: Path, monkeypatch) 
     with StateStore(state_root / "state.db") as store:
         store.create_run("ralph-plan.yaml", run_id="run-001", status="blocked_system", task_ids=["TASK-001"])
         store.transition_task("run-001", "TASK-001", "blocked_system", attempt_count=2, last_error="provider crashed")
-        store.update_task_failure("run-001", "TASK-001", "provider_crash")
+        store.update_task_failure(
+            "run-001",
+            "TASK-001",
+            "provider_crash",
+            '{"summary":"provider crashed during review"}',
+        )
         store.update_phase_checkpoint("run-001", "review:TASK-001:attempt:2")
         store.connection.execute(
             """
@@ -372,6 +377,7 @@ def test_doctor_reports_failure_and_recommendation(tmp_path: Path, monkeypatch) 
     assert "Run:" in result.stdout
     assert "blocked_system" in result.stdout
     assert "failure: provider_crash" in result.stdout
+    assert "detail: provider crashed during review" in result.stdout
     assert "review:TASK-001:attempt:2" in result.stdout
     assert "Recovery attempts:" in result.stdout
     assert "diagnosis" in result.stdout

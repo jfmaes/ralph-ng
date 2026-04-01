@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Iterable
 
 from .plan import Task
+from .review_bundle import collect_changed_file_snippets
 
 
 _EXECUTOR_SYSTEM = """\
@@ -148,12 +149,9 @@ class PromptBuilder:
 
     def _render_expected_files(self, task: Task) -> str:
         rendered: list[str] = []
+        snippets = collect_changed_file_snippets(self.repo_root, task.expected_files)
         for relative_path in task.expected_files:
-            full_path = self.repo_root / relative_path
             rendered.append(f"### {relative_path}")
-            if full_path.exists():
-                rendered.append(full_path.read_text(encoding="utf-8").rstrip())
-            else:
-                rendered.append("(file does not exist yet)")
+            rendered.append(snippets.get(relative_path, "(file does not exist yet)"))
             rendered.append("")
         return "\n".join(rendered).rstrip()

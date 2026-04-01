@@ -16,7 +16,7 @@ from ralph_ng.config import RalphConfig, RoleConfig, RolesConfig
 
 def _config_with_roles(
     executor_provider: str = "claude",
-    executor_model: str = "sonnet",
+    executor_model: str = "opus",
     reviewer_provider: str = "codex",
     reviewer_model: str = "gpt-5.3-codex",
     reviewer_reasoning_effort: str | None = None,
@@ -42,7 +42,7 @@ class TestBuildExecutor:
         executor = build_executor(config)
         assert isinstance(executor, TransportExecutorAdapter)
         assert isinstance(executor.transport, CliClaudeTransport)
-        assert executor.transport.model == "sonnet"
+        assert executor.transport.model == "opus"
 
     def test_supports_codex_as_executor(self) -> None:
         config = _config_with_roles(executor_provider="codex", executor_model="gpt-5.3-codex")
@@ -56,7 +56,7 @@ class TestBuildExecutor:
         executor = build_executor(config)
         assert isinstance(executor, ClaudeExecutorAdapter)
         assert isinstance(executor.transport, CliClaudeTransport)
-        assert executor.transport.model == "sonnet"
+        assert executor.transport.model == "opus"
 
 
 class TestBuildReviewer:

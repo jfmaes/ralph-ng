@@ -38,9 +38,8 @@ class RalphDashboardApp(App[None]):
         padding: 0 1;
     }
 
-    #overview {
-        height: auto;
-        max-height: 50%;
+    #main-content {
+        height: 1fr;
     }
 
     #left-column {
@@ -81,23 +80,22 @@ class RalphDashboardApp(App[None]):
         height: 1fr;
         min-height: 6;
         border: round $panel;
-        margin: 0 1;
-    }
-
-    #reasoning-panes {
-        height: 1fr;
+        margin: 0 0;
     }
 
     #event-log {
-        height: 8;
+        height: 1fr;
+        min-height: 6;
         border: round $panel;
-        margin: 0 1 1 1;
+        margin: 0 0;
     }
     """
 
     BINDINGS = [
         ("p", "pause_run", "Pause"),
         ("s", "stop_run", "Stop"),
+        ("e", "clear_executor", "Clear Exec"),
+        ("r", "clear_reviewer", "Clear Rev"),
         ("q", "quit_dashboard", "Quit"),
         ("ctrl+c", "quit_dashboard", "Quit"),
     ]
@@ -148,25 +146,29 @@ class RalphDashboardApp(App[None]):
         self._activity_context: tuple[str, int] | None = None
         self._executor_seen = 0
         self._reviewer_seen = 0
+        self._review_verdict_shown: str | None = None
         self._event_seen = 0
+        self._executor_was_active = False
+        self._reviewer_was_active = False
+        self._executor_inactive_since: float | None = None
+        self._reviewer_inactive_since: float | None = None
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=False)
         yield Static(id="summary")
-        with Horizontal(id="overview"):
+        with Horizontal(id="main-content"):
             with Vertical(id="left-column"):
                 yield Static(id="banner")
                 yield Static(id="tasks")
                 yield Static(id="cost")
+                yield Static(Text("Events", style="bold dim"), id="events-title")
+                yield RichLog(id="event-log", wrap=True, markup=False, auto_scroll=True)
             with Vertical(id="right-column"):
                 yield Static(id="current-task")
-        with Vertical(id="reasoning-panes"):
-            yield Static(Text("Executor Reasoning", style="bold cyan"), classes="reasoning-title")
-            yield RichLog(id="executor-log", wrap=True, markup=True, auto_scroll=True)
-            yield Static(Text("Reviewer Reasoning", style="bold magenta"), classes="reasoning-title")
-            yield RichLog(id="reviewer-log", wrap=True, markup=True, auto_scroll=True)
-        yield Static(Text("Events", style="bold dim"), id="events-title")
-        yield RichLog(id="event-log", wrap=True, markup=False, auto_scroll=True)
+                yield Static(Text("Executor Reasoning", style="bold cyan"), id="executor-title", classes="reasoning-title")
+                yield RichLog(id="executor-log", wrap=True, markup=True, auto_scroll=True)
+                yield Static(Text("Reviewer Reasoning", style="bold magenta"), id="reviewer-title", classes="reasoning-title")
+                yield RichLog(id="reviewer-log", wrap=True, markup=True, auto_scroll=True)
         yield Footer()
 
     def on_mount(self) -> None:
@@ -197,6 +199,14 @@ class RalphDashboardApp(App[None]):
         current_task = None if current_task_id is None else task_states.get(current_task_id)
 
         self.renderer._update_provider_activity(self.run_id, current_task)
+
+        # Update reasoning pane titles with model names
+        exec_model = self.renderer.executor_activity.model
+        rev_model = self.renderer.reviewer_activity.model
+        exec_label = f"Executor Reasoning ({exec_model})" if exec_model else "Executor Reasoning"
+        rev_label = f"Reviewer Reasoning ({rev_model})" if rev_model else "Reviewer Reasoning"
+        self.query_one("#executor-title", Static).update(Text(exec_label, style="bold cyan"))
+        self.query_one("#reviewer-title", Static).update(Text(rev_label, style="bold magenta"))
 
         self.query_one("#summary", Static).update(self.renderer._build_header(run))
         banner = self.renderer._build_problem_banner(self.run_id, run, task_states, current_task)
@@ -300,6 +310,7 @@ class RalphDashboardApp(App[None]):
                 self._activity_context = None
                 self._executor_seen = 0
                 self._reviewer_seen = 0
+                self._review_verdict_shown = None
             return
 
         context = (current_task.task_id, current_task.attempt_count)
@@ -312,67 +323,161 @@ class RalphDashboardApp(App[None]):
             self._activity_context = context
             self._executor_seen = 0
             self._reviewer_seen = 0
+            self._review_verdict_shown = None
 
         executor_events = self._collect_role_events(provider_events, "executor")
         reviewer_events = self._collect_role_events(provider_events, "reviewer")
 
+        # Check for review findings to display in reviewer pane
+        review_summary, review_findings = self.renderer._latest_review_summary(current_task)
+        challenge_pending = self.renderer._review_challenge_pending(self.run_id, current_task)
+        verdict_key = (review_summary, challenge_pending)
+
         if len(executor_events) != self._executor_seen:
             self._rewrite_role_log(executor_log, executor_events)
             self._executor_seen = len(executor_events)
-        if len(reviewer_events) != self._reviewer_seen:
-            self._rewrite_role_log(reviewer_log, reviewer_events)
+
+        reviewer_needs_rewrite = (
+            len(reviewer_events) != self._reviewer_seen
+            or verdict_key != self._review_verdict_shown
+        )
+        if reviewer_needs_rewrite:
+            self._rewrite_reviewer_log(
+                reviewer_log,
+                reviewer_events,
+                review_summary,
+                review_findings,
+                challenge_pending,
+            )
             self._reviewer_seen = len(reviewer_events)
+            self._review_verdict_shown = verdict_key
 
         if self._executor_seen == 0 and self.renderer.executor_activity.active:
             executor_log.clear()
-            executor_log.write(Text("waiting for provider output...", style="dim italic"))
+            provider = self.renderer.executor_activity.provider or "provider"
+            executor_log.write(Text(f"waiting for {provider} output...", style="dim italic"))
             self._executor_seen = -1
-        if self._reviewer_seen == 0 and self.renderer.reviewer_activity.active:
+        if self._reviewer_seen == 0 and not review_summary and self.renderer.reviewer_activity.active:
             reviewer_log.clear()
-            reviewer_log.write(Text("waiting for provider output...", style="dim italic"))
+            provider = self.renderer.reviewer_activity.provider or "provider"
+            if provider == "codex":
+                reviewer_log.write(Text(
+                    "codex reviewing... (no streaming — output appears when done)",
+                    style="dim italic",
+                ))
+            else:
+                reviewer_log.write(Text(f"waiting for {provider} output...", style="dim italic"))
             self._reviewer_seen = -1
+
+        # Auto-clear stale panes when the other role takes over.
+        # When a role goes inactive while the other becomes active, clear
+        # the inactive pane after a short delay so operators don't see
+        # outdated output.
+        now = time.monotonic()
+        stale_seconds = 3.0
+
+        exec_active = self.renderer.executor_activity.active
+        rev_active = self.renderer.reviewer_activity.active
+
+        # Track executor active → inactive transition
+        if self._executor_was_active and not exec_active:
+            self._executor_inactive_since = now
+        elif exec_active:
+            self._executor_inactive_since = None
+        self._executor_was_active = exec_active
+
+        # Track reviewer active → inactive transition
+        if self._reviewer_was_active and not rev_active:
+            self._reviewer_inactive_since = now
+        elif rev_active:
+            self._reviewer_inactive_since = None
+        self._reviewer_was_active = rev_active
+
+        # Clear executor pane when stale and reviewer is now active
+        if (
+            self._executor_inactive_since is not None
+            and rev_active
+            and now - self._executor_inactive_since >= stale_seconds
+        ):
+            executor_log.clear()
+            self._executor_seen = 0
+            self._executor_inactive_since = None
+
+        # Clear reviewer pane when stale and executor is now active.
+        # Use a longer delay when a verdict is showing so the operator
+        # can read the findings before they disappear.
+        rev_stale = stale_seconds if not review_summary else 8.0
+        if (
+            self._reviewer_inactive_since is not None
+            and exec_active
+            and now - self._reviewer_inactive_since >= rev_stale
+        ):
+            reviewer_log.clear()
+            self._reviewer_seen = 0
+            self._review_verdict_shown = None
+            self._reviewer_inactive_since = None
 
     def _collect_role_events(
         self,
         provider_events: list,
         role: str,
     ) -> list:
-        textual = [
+        events = [
             event
             for event in provider_events
             if event.role == role
             and event.event_type in {
+                ProviderEventType.AGENT_STARTED,
                 ProviderEventType.AGENT_THOUGHT_STARTED,
                 ProviderEventType.AGENT_THOUGHT_DELTA,
                 ProviderEventType.AGENT_THOUGHT_FINISHED,
                 ProviderEventType.AGENT_COMMENTARY,
+                ProviderEventType.AGENT_PROGRESS,
                 ProviderEventType.AGENT_STRUCTURED_OUTPUT,
+                ProviderEventType.AGENT_FINISHED,
                 ProviderEventType.AGENT_ERROR,
             }
-            and str(event.payload.get("text", "")).strip()
         ]
-        if not textual:
-            textual = [
-                event
-                for event in provider_events
-                if event.role == role
-                and event.event_type == ProviderEventType.AGENT_PROGRESS
-                and str(event.payload.get("text", "")).strip()
-            ]
-        return textual
+        return self._compress_role_events(events)
 
     def _rewrite_role_log(self, log: RichLog, textual_events: list) -> None:
         log.clear()
-        rendered_items = self._render_role_events(textual_events)
-        for item in rendered_items[-8:]:
+        selected_events = self._select_events_for_log_display(textual_events, limit=12)
+        rendered_items = self._render_role_events(selected_events)
+        for item in rendered_items:
             log.write(item)
+
+    def _rewrite_reviewer_log(
+        self,
+        log: RichLog,
+        textual_events: list,
+        review_summary: str | None,
+        review_findings: list[str],
+        challenge_pending: bool,
+    ) -> None:
+        log.clear()
+        selected_events = self._select_events_for_log_display(textual_events, limit=12)
+        rendered_items = self._render_role_events(selected_events)
+        for item in rendered_items:
+            log.write(item)
+        if review_summary:
+            log.write(Text(""))
+            verdict_style = "yellow" if (review_findings or challenge_pending) else "green"
+            log.write(Text.assemble(
+                ("First-Pass Verdict: " if challenge_pending else "Review Verdict: ", "bold magenta"),
+                (review_summary, verdict_style),
+            ))
+            if challenge_pending:
+                log.write(Text("Challenge pending", style="bold yellow"))
+            for finding_line in review_findings:
+                log.write(Text(f"  {finding_line}", style="red"))
 
     def _render_role_events(self, textual_events: list) -> list[Text]:
         items: list[tuple[str, object]] = []
         thought_positions: dict[str, tuple[int, int]] = {}
 
         for event in textual_events:
-            text = str(event.payload.get("text", "")).strip()
+            text = self._event_display_text(event)
             if not text:
                 continue
             if event.event_type in {
@@ -405,18 +510,112 @@ class RalphDashboardApp(App[None]):
                 continue
 
             event = payload
-            text = str(event.payload.get("text", "")).strip()
+            text = self._event_display_text(event)
             event_type = event.event_type
             if event_type == ProviderEventType.AGENT_ERROR:
                 rendered.append(Text(f"ERROR: {text}", style="bold red"))
             elif event_type == ProviderEventType.AGENT_STRUCTURED_OUTPUT:
                 rendered.append(Text(text, style="green"))
+            elif event_type == ProviderEventType.AGENT_STARTED:
+                rendered.append(Text(f"  {text}", style="dim cyan"))
+            elif event_type == ProviderEventType.AGENT_FINISHED:
+                style = "green" if "completed" in text else "yellow"
+                rendered.append(Text(f"  {text}", style=style))
             elif event_type == ProviderEventType.AGENT_PROGRESS:
                 rendered.append(Text(f"  {text}", style="dim"))
             else:
                 rendered.append(Text(text))
 
         return rendered
+
+    def _select_events_for_log_display(self, events: list, *, limit: int) -> list:
+        if len(events) <= limit:
+            return events
+
+        high_signal_types = {
+            ProviderEventType.AGENT_THOUGHT_STARTED,
+            ProviderEventType.AGENT_THOUGHT_DELTA,
+            ProviderEventType.AGENT_THOUGHT_FINISHED,
+            ProviderEventType.AGENT_COMMENTARY,
+            ProviderEventType.AGENT_STRUCTURED_OUTPUT,
+            ProviderEventType.AGENT_ERROR,
+        }
+        selected: set[int] = set()
+
+        high_signal_indexes = [
+            idx for idx, event in enumerate(events)
+            if event.event_type in high_signal_types
+        ]
+        for idx in high_signal_indexes[-6:]:
+            selected.add(idx)
+
+        remaining = max(limit - len(selected), 0)
+        for idx in range(len(events) - 1, -1, -1):
+            if remaining == 0:
+                break
+            if idx in selected:
+                continue
+            selected.add(idx)
+            remaining -= 1
+
+        return [events[idx] for idx in sorted(selected)]
+
+    def _compress_role_events(self, events: list) -> list:
+        compressed: list = []
+        pending_progress = None
+
+        def flush_pending() -> None:
+            nonlocal pending_progress
+            if pending_progress is not None:
+                compressed.append(pending_progress)
+                pending_progress = None
+
+        for event in events:
+            text = self._event_display_text(event)
+            if not text:
+                continue
+            is_low_signal_progress = (
+                event.event_type == ProviderEventType.AGENT_PROGRESS
+                and (text.startswith("tokens ") or text == "tool result received")
+            )
+            if is_low_signal_progress:
+                pending_progress = event
+                continue
+
+            flush_pending()
+            if compressed:
+                prev = compressed[-1]
+                if (
+                    prev.event_type == event.event_type
+                    and self._event_display_text(prev) == text
+                    and event.event_type in {
+                        ProviderEventType.AGENT_PROGRESS,
+                        ProviderEventType.AGENT_STARTED,
+                        ProviderEventType.AGENT_FINISHED,
+                    }
+                ):
+                    compressed[-1] = event
+                    continue
+            compressed.append(event)
+
+        flush_pending()
+        return compressed
+
+    @staticmethod
+    def _event_display_text(event) -> str:
+        payload = event.payload if isinstance(event.payload, dict) else {}
+        text = str(payload.get("text", "")).strip()
+        summary = str(payload.get("summary", "")).strip()
+        if text:
+            return text
+        if summary:
+            return summary
+        if event.event_type == ProviderEventType.AGENT_STARTED:
+            return "session started"
+        if event.event_type == ProviderEventType.AGENT_FINISHED:
+            status = str(payload.get("status", "")).strip() or "finished"
+            return f"session {status}"
+        return ""
 
     def _sync_event_log(self, run_events) -> None:
         event_log = self.query_one("#event-log", RichLog)
@@ -458,6 +657,20 @@ class RalphDashboardApp(App[None]):
             self.worker.join(timeout=15.0)
         self.exit()
 
+    def action_clear_executor(self) -> None:
+        """Clear the executor reasoning log to check for new output."""
+        self.query_one("#executor-log", RichLog).clear()
+        # Keep _executor_seen at its current value so the sync loop won't
+        # immediately repopulate with the same events.  New events will
+        # still trigger a rewrite when len(events) changes.
+        self.notify("Executor log cleared.")
+
+    def action_clear_reviewer(self) -> None:
+        """Clear the reviewer reasoning log to check for new output."""
+        self.query_one("#reviewer-log", RichLog).clear()
+        # Same approach — preserve the seen count to prevent instant repopulation.
+        self.notify("Reviewer log cleared.")
+
     def action_quit_dashboard(self) -> None:
         """Quit the dashboard, cleanly stopping the orchestrator if controlling."""
         if self.worker is not None and self.worker.is_alive():
@@ -480,30 +693,38 @@ def run_textual_progress(
     orchestrator: object | None = None,
     state_root: str | None = None,
 ):
-    app = RalphDashboardApp(
-        run_id=run_id,
-        plan=plan,
-        config=config,
-        store=store,
-        events=events,
-        provider_event_store=provider_event_store,
-        executor_activity_tracker=executor_activity_tracker,
-        reviewer_activity_tracker=reviewer_activity_tracker,
-        orchestrator_call=orchestrator_call,
-        orchestrator=orchestrator,
-        state_root=state_root,
-        auto_exit_on_terminal=True,
-    )
-    app.run()
-    if app.error_holder:
-        raise next(iter(app.error_holder.values()))
-    if orchestrator_call is not None and "outcome" not in app.outcome_holder:
-        # Dashboard was quit by operator — run was paused, not an error
-        run = store.get_run(run_id)
-        if run is not None and run.status == "paused":
-            return app.outcome_holder.get("outcome")
-        raise RuntimeError("Textual dashboard exited before the run produced an outcome.")
-    return app.outcome_holder.get("outcome")
+    # The dashboard refresh loop runs on the UI thread while the orchestrator
+    # runs on a worker thread. Use a separate SQLite connection so both threads
+    # do not contend on the same StateStore handle.
+    ui_store = StateStore(store.db_path)
+    try:
+        app = RalphDashboardApp(
+            run_id=run_id,
+            plan=plan,
+            config=config,
+            store=ui_store,
+            events=events,
+            provider_event_store=provider_event_store,
+            executor_activity_tracker=executor_activity_tracker,
+            reviewer_activity_tracker=reviewer_activity_tracker,
+            orchestrator_call=orchestrator_call,
+            orchestrator=orchestrator,
+            state_root=state_root,
+            auto_exit_on_terminal=True,
+        )
+        app.run()
+        if app.error_holder:
+            _mark_run_paused_after_crash(store, run_id, next(iter(app.error_holder.values())))
+            raise next(iter(app.error_holder.values()))
+        if orchestrator_call is not None and "outcome" not in app.outcome_holder:
+            # Dashboard was quit by operator — run was paused, not an error
+            run = store.get_run(run_id)
+            if run is not None and run.status == "paused":
+                return app.outcome_holder.get("outcome")
+            raise RuntimeError("Textual dashboard exited before the run produced an outcome.")
+        return app.outcome_holder.get("outcome")
+    finally:
+        ui_store.close()
 
 
 def watch_textual_progress(
@@ -515,14 +736,41 @@ def watch_textual_progress(
     events: EventLogger,
     provider_event_store: ProviderEventStore,
 ) -> None:
-    app = RalphDashboardApp(
-        run_id=run_id,
-        plan=plan,
-        config=config,
-        store=store,
-        events=events,
-        provider_event_store=provider_event_store,
-        orchestrator_call=None,
-        auto_exit_on_terminal=False,
+    ui_store = StateStore(store.db_path)
+    try:
+        app = RalphDashboardApp(
+            run_id=run_id,
+            plan=plan,
+            config=config,
+            store=ui_store,
+            events=events,
+            provider_event_store=provider_event_store,
+            orchestrator_call=None,
+            auto_exit_on_terminal=False,
+        )
+        app.run()
+    finally:
+        ui_store.close()
+
+
+def _mark_run_paused_after_crash(store: StateStore, run_id: str, exc: BaseException) -> None:
+    """Best-effort cleanup for unexpected dashboard/orchestrator exceptions."""
+    import json as _json
+
+    run = store.get_run(run_id)
+    if run is None or run.status != "running":
+        return
+    detail = str(exc).strip() or exc.__class__.__name__
+    detail = detail[:500]
+    stop_reason = _json.dumps(
+        {
+            "cause": "unhandled_exception",
+            "detail": detail,
+            "exception_type": exc.__class__.__name__,
+        }
     )
-    app.run()
+    try:
+        store.release_controller(run_id, stop_reason=stop_reason)
+        store.update_run_status(run_id, "paused")
+    except Exception:
+        pass

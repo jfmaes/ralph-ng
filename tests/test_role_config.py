@@ -21,7 +21,7 @@ class TestRoleConfig:
         rc = RoleConfig()
         assert rc.provider == "claude"
         assert rc.transport == "cli"
-        assert rc.model == "sonnet"
+        assert rc.model == "opus"
         assert rc.cli_path == "claude"
         assert rc.reasoning_effort is None
         assert rc.service_tier is None
@@ -95,7 +95,7 @@ class TestRalphConfigBackwardCompat:
     def test_no_roles_section(self) -> None:
         config = RalphConfig()
         assert config.roles is None
-        assert config.models.executor == "sonnet"
+        assert config.models.executor == "opus"
 
     def test_with_roles_section(self) -> None:
         config = RalphConfig(

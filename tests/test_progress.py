@@ -1,4 +1,5 @@
 from pathlib import Path
+from datetime import UTC, datetime, timedelta
 
 from ralph_ng.adapters.streaming import ActivityKind, LiveActivityTracker, make_activity
 from ralph_ng.events import EventLogger
@@ -363,6 +364,70 @@ def test_activity_panel_groups_thought_events(tmp_path: Path) -> None:
     assert "Thought 2:" in output
 
 
+def test_activity_panel_shows_running_timer_and_model_from_provider_events(tmp_path: Path) -> None:
+    store = StateStore(tmp_path / "state.db")
+    store.create_run("ralph-plan.yaml", run_id="run-001", status="running", task_ids=["TASK-001"])
+    store.transition_task("run-001", "TASK-001", "in_progress", attempt_count=1)
+    events = EventLogger(tmp_path / "events.jsonl")
+
+    from ralph_ng.providers.event_store import ProviderEventStore
+    from ralph_ng.providers.events import ProviderEventType, make_event
+
+    pe_store = ProviderEventStore(tmp_path)
+    started = make_event(
+        run_id="run-001", task_id="TASK-001", attempt_number=1,
+        provider="claude", role="executor", review_round=0,
+        event_type=ProviderEventType.AGENT_STARTED,
+        payload={"model": "opus"},
+    )
+    started.timestamp = (datetime.now(UTC) - timedelta(seconds=65)).isoformat()
+    pe_store.log(started)
+
+    renderer = ProgressRenderer(
+        store=store,
+        events=events,
+        provider_event_store=pe_store,
+    )
+
+    output = renderer.render_text("run-001", plan=make_plan())
+
+    assert "Executor" in output
+    assert "claude/opus" in output
+    assert "running for" in output
+    assert "01:05 / 10:00" in output
+
+
+def test_focus_panel_shows_active_reviewer_timer(tmp_path: Path) -> None:
+    store = StateStore(tmp_path / "state.db")
+    store.create_run("ralph-plan.yaml", run_id="run-001", status="running", task_ids=["TASK-001"])
+    store.transition_task("run-001", "TASK-001", "review", attempt_count=1)
+    events = EventLogger(tmp_path / "events.jsonl")
+
+    from ralph_ng.providers.event_store import ProviderEventStore
+    from ralph_ng.providers.events import ProviderEventType, make_event
+
+    pe_store = ProviderEventStore(tmp_path)
+    started = make_event(
+        run_id="run-001", task_id="TASK-001", attempt_number=1,
+        provider="codex", role="reviewer", review_round=1,
+        event_type=ProviderEventType.AGENT_STARTED,
+        payload={"model": "gpt-5.3-codex"},
+    )
+    started.timestamp = (datetime.now(UTC) - timedelta(seconds=42)).isoformat()
+    pe_store.log(started)
+
+    renderer = ProgressRenderer(
+        store=store,
+        events=events,
+        provider_event_store=pe_store,
+    )
+
+    output = renderer.render_text("run-001", plan=make_plan())
+
+    assert "reviewer running for 00:42" in output
+    assert "(codex/gpt-5.3-codex)" in output
+
+
 def test_focus_panel_shows_verification_and_risk(tmp_path: Path) -> None:
     store = StateStore(tmp_path / "state.db")
     store.create_run("ralph-plan.yaml", run_id="run-001", status="running", task_ids=["TASK-001"])
@@ -427,7 +492,43 @@ def test_focus_panel_shows_latest_reviewer_findings(tmp_path: Path) -> None:
     output = renderer.render_text("run-001", plan=make_plan())
 
     assert "review verdict: reject (0.93)" in output
-    assert "F1 [critical] (correctness): Header" in output
-    assert "callback never opens the modal." in output
-    assert "F2 [important] (testing): Clipboard errors" in output
-    assert "are not handled." in output
+    # Detailed findings are now shown in the Reviewer Reasoning pane, not the
+    # focus panel.  The focus panel shows a compact summary with finding count.
+    assert "(2 findings)" in output
+
+
+def test_marks_first_pass_verdict_when_challenge_is_pending(tmp_path: Path) -> None:
+    store = StateStore(tmp_path / "state.db")
+    store.create_run("ralph-plan.yaml", run_id="run-001", status="running", task_ids=["TASK-001"])
+    store.transition_task("run-001", "TASK-001", "review", attempt_count=1)
+    store.update_phase_checkpoint("run-001", "challenge_executor:TASK-001:attempt:1")
+    attempt = store.record_attempt(
+        "run-001",
+        "TASK-001",
+        1,
+        review_path=str(tmp_path / "TASK-001_attempt_1_round1.json"),
+    )
+    review_payload = {
+        "status": "completed",
+        "findings": {
+            "decision": "accept",
+            "confidence": 0.77,
+            "spec_compliance": "pass",
+            "summary": "Looks good overall",
+            "findings": [
+                {
+                    "id": "F1",
+                    "severity": "minor",
+                    "category": "testing",
+                    "description": "Behavioral verification is insufficient.",
+                },
+            ],
+        },
+    }
+    Path(attempt.review_path or "").write_text(__import__("json").dumps(review_payload), encoding="utf-8")
+    renderer = ProgressRenderer(store=store, events=EventLogger(tmp_path / "events.jsonl"))
+
+    output = renderer.render_text("run-001", plan=make_plan())
+
+    assert "first-pass verdict: accept (0.77)" in output
+    assert "challenge pending" in output

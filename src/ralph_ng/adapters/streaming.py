@@ -167,6 +167,7 @@ def stream_subprocess(
     *,
     cwd: str | None = None,
     timeout_seconds: float,
+    stdin_path: str | None = None,
     on_line: Callable[[str], None] | None = None,
     on_stderr_line: Callable[[str], None] | None = None,
     on_heartbeat: Callable[[], None] | None = None,
@@ -185,11 +186,15 @@ def stream_subprocess(
     Returns a ``StreamResult`` with returncode, collected stderr, and
     whether the process was killed due to timeout.
     """
+    stdin_handle = None
+    if stdin_path is not None:
+        stdin_handle = open(stdin_path, "r", encoding="utf-8")
+
     process = subprocess.Popen(
         command,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
-        stdin=subprocess.DEVNULL,
+        stdin=stdin_handle if stdin_handle is not None else subprocess.DEVNULL,
         text=True,
         bufsize=1,
         cwd=cwd,
@@ -257,6 +262,8 @@ def stream_subprocess(
         process.wait()
         timer.cancel()
         stderr_thread.join(timeout=5.0)
+        if stdin_handle is not None:
+            stdin_handle.close()
 
     return StreamResult(
         returncode=process.returncode,
