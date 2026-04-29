@@ -6,11 +6,13 @@ import re
 import subprocess
 import sys
 
+import pytest
+
 from ralph_ng.adapters.base import ExecutorResult, InvocationStatus
 from ralph_ng.config import RalphConfig, RolesConfig, RoleConfig
 from ralph_ng.events import EventLogger
 from ralph_ng.git_manager import GitManager
-from ralph_ng.orchestrator import Orchestrator, RunStatus
+from ralph_ng.orchestrator import Orchestrator, OrchestratorError, RunStatus
 from ralph_ng.plan import Plan
 from ralph_ng.prompt_builder import PromptBuilder
 from ralph_ng.review_bundle import ReviewBundleBuilder
@@ -140,17 +142,19 @@ def make_orchestrator(
     executor: FakeExecutor,
     reviewer: FakeReviewer,
     *,
+    config: RalphConfig | None = None,
     git_manager: GitManager | None = None,
     max_retries: int = 3,
 ) -> tuple[Path, StateStore, EventLogger, Orchestrator]:
     repo = executor.repo_root
     state_root = tmp_path / "state-root"
-    config = RalphConfig(
-        roles=RolesConfig(
-            executor=RoleConfig(provider="claude", model="sonnet"),
-            reviewer=RoleConfig(provider="codex", model="gpt-5.3-codex", cli_path="codex"),
-        ),
-    )
+    if config is None:
+        config = RalphConfig(
+            roles=RolesConfig(
+                executor=RoleConfig(provider="claude", model="sonnet"),
+                reviewer=RoleConfig(provider="codex", model="gpt-5.3-codex", cli_path="codex"),
+            ),
+        )
     config.ralph.max_retries_per_task = max_retries
     store = StateStore(state_root / "state.db")
     events = EventLogger(state_root / "events.jsonl")
@@ -356,6 +360,65 @@ def test_happy_path_executes_three_task_plan_to_completion(tmp_path: Path) -> No
     assert store.get_task_state("run-001", "TASK-003").state == "done"
     assert "TASK-003" in (repo / "work.txt").read_text(encoding="utf-8")
     assert any(event.event_type == "run.stopped" for event in events.read_events())
+
+
+def test_current_branch_strategy_stays_on_required_branch(tmp_path: Path) -> None:
+    repo = init_repo(tmp_path)
+    plan = make_plan(1)
+    executor = FakeExecutor(repo, {"TASK-001": [executor_write_marker("TASK-001")]})
+    reviewer = FakeReviewer({"TASK-001": [accept_verdict()]})
+    config = RalphConfig(
+        roles=RolesConfig(
+            executor=RoleConfig(provider="claude", model="sonnet"),
+            reviewer=RoleConfig(provider="codex", model="gpt-5.3-codex", cli_path="codex"),
+        ),
+    )
+    config.git.branch_strategy = "current"
+    config.git.required_branch = "main"
+    _, _, events, orchestrator = make_orchestrator(
+        tmp_path,
+        plan,
+        executor,
+        reviewer,
+        config=config,
+    )
+
+    outcome = orchestrator.start(run_id="run-001")
+
+    assert outcome.status is RunStatus.COMPLETED
+    assert git(repo, "branch", "--show-current") == "main"
+    assert "ralph/ralph-plan/run-001" not in git(repo, "branch", "--format=%(refname:short)")
+    run_started = next(event for event in events.read_events() if event.event_type == "run.started")
+    assert run_started.data["branch"] == "main"
+
+
+def test_current_branch_strategy_refuses_wrong_branch(tmp_path: Path) -> None:
+    repo = init_repo(tmp_path)
+    git(repo, "checkout", "-b", "feature")
+    plan = make_plan(1)
+    executor = FakeExecutor(repo, {"TASK-001": [executor_write_marker("TASK-001")]})
+    reviewer = FakeReviewer({"TASK-001": [accept_verdict()]})
+    config = RalphConfig(
+        roles=RolesConfig(
+            executor=RoleConfig(provider="claude", model="sonnet"),
+            reviewer=RoleConfig(provider="codex", model="gpt-5.3-codex", cli_path="codex"),
+        ),
+    )
+    config.git.branch_strategy = "current"
+    config.git.required_branch = "main"
+    _, store, _, orchestrator = make_orchestrator(
+        tmp_path,
+        plan,
+        executor,
+        reviewer,
+        config=config,
+    )
+
+    with pytest.raises(OrchestratorError, match="requires branch main"):
+        orchestrator.start(run_id="run-001")
+
+    assert store.get_run("run-001") is None
+    assert git(repo, "branch", "--show-current") == "feature"
 
 
 def test_task_limit_pauses_and_resume_counts_new_completions_only(tmp_path: Path) -> None:

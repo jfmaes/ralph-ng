@@ -194,6 +194,7 @@ class Orchestrator:
         if self.store.get_run(run_id) is not None:
             raise OrchestratorError(f"Run {run_id} already exists.")
 
+        branch_name = self._prepare_start_branch(run_id)
         self._ensure_run_paths(run_id)
         self.store.create_run(
             self._stored_plan_path(),
@@ -204,10 +205,6 @@ class Orchestrator:
         self.store.acquire_controller(run_id, _os.getpid())
         self._start_heartbeat(run_id)
         try:
-            branch_name = self.git_manager.ensure_managed_branch(
-                plan_name=self.plan_path.stem,
-                run_id=run_id,
-            )
             self.store.update_phase_checkpoint(run_id, "run:started")
             self.events.log(
                 "run.started",
@@ -239,6 +236,7 @@ class Orchestrator:
         if self.store.get_run(run_id) is None:
             raise OrchestratorError(f"Unknown run {run_id}.")
         self._ensure_run_paths(run_id)
+        self._ensure_resume_branch()
 
         # Reset blocked/failed tasks so they can be retried.
         # With --max-retries: increase budget and continue from current attempt.
@@ -262,6 +260,28 @@ class Orchestrator:
                 stop_reason = json.dumps({"cause": "operator_interrupt"})
                 self._cleanup_on_pause(run_id)
             self.store.release_controller(run_id, stop_reason=stop_reason)
+
+    def _prepare_start_branch(self, run_id: str) -> str:
+        if self.config.git.branch_strategy == "managed":
+            return self.git_manager.ensure_managed_branch(
+                plan_name=self.plan_path.stem,
+                run_id=run_id,
+            )
+        return self._ensure_current_required_branch()
+
+    def _ensure_resume_branch(self) -> None:
+        if self.config.git.branch_strategy == "current":
+            self._ensure_current_required_branch()
+
+    def _ensure_current_required_branch(self) -> str:
+        branch_name = self.git_manager.current_branch()
+        required_branch = self.config.git.required_branch
+        if branch_name != required_branch:
+            raise OrchestratorError(
+                f"Current-branch strategy requires branch {required_branch}; "
+                f"currently on {branch_name}."
+            )
+        return branch_name
 
     def _reset_blocked_tasks(
         self,

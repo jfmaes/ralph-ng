@@ -28,7 +28,26 @@ def test_applies_defaults_for_omitted_sections(fixtures_dir: Path) -> None:
     assert config.ralph.auto_escalate_model == "opus"
     assert config.models.executor == "opus"
     assert config.timeouts.verification_command_seconds == 120
+    assert config.git.branch_strategy == "managed"
+    assert config.git.required_branch == "main"
     assert config.git.force_push is False
+
+
+def test_loads_current_branch_strategy(tmp_path: Path) -> None:
+    config_path = tmp_path / "ralph.toml"
+    config_path.write_text(
+        """
+[git]
+branch_strategy = "current"
+required_branch = "release"
+""",
+        encoding="utf-8",
+    )
+
+    config = load_config(config_path)
+
+    assert config.git.branch_strategy == "current"
+    assert config.git.required_branch == "release"
 
 
 def test_missing_config_file_returns_defaults(tmp_path: Path) -> None:
@@ -38,6 +57,8 @@ def test_missing_config_file_returns_defaults(tmp_path: Path) -> None:
     assert config.ralph.auto_escalate is None
     assert config.ralph.auto_escalate_model == "opus"
     assert config.models.executor == "opus"
+    assert config.git.branch_strategy == "managed"
+    assert config.git.required_branch == "main"
     assert config.git.protected_branches == ["main", "master"]
 
 
@@ -46,3 +67,19 @@ def test_invalid_config_is_rejected(fixtures_dir: Path) -> None:
         load_config(fixtures_dir / "invalid_ralph.toml")
 
     assert "Invalid config" in str(exc_info.value)
+
+
+def test_invalid_branch_strategy_is_rejected(tmp_path: Path) -> None:
+    config_path = tmp_path / "ralph.toml"
+    config_path.write_text(
+        """
+[git]
+branch_strategy = "detached"
+""",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ConfigLoadError) as exc_info:
+        load_config(config_path)
+
+    assert "branch_strategy" in str(exc_info.value)

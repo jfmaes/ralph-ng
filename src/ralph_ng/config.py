@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from typing import Literal
 from pathlib import Path
 import tomllib
 
@@ -64,8 +65,17 @@ class TimeoutsConfig(BaseModel):
 class GitConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
+    branch_strategy: Literal["managed", "current"] = "managed"
+    required_branch: str = "main"
     protected_branches: list[str] = Field(default_factory=lambda: ["main", "master"])
     force_push: bool = False
+
+    @field_validator("required_branch")
+    @classmethod
+    def validate_required_branch(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("required_branch must not be empty")
+        return value
 
     @field_validator("protected_branches")
     @classmethod
