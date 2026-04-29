@@ -46,8 +46,8 @@ _sigint_count = 0
 _sigint_lock = threading.Lock()
 
 
-def _cleanup_dirty_workspace(repo_root: Path, console: Console) -> None:
-    """Reset uncommitted changes left by a dead/paused run."""
+def _refuse_dirty_workspace_after_stale_run(repo_root: Path, console: Console) -> None:
+    """Stop before destructive cleanup when a stale run left a dirty tree."""
     status = subprocess.run(
         ["git", "status", "--porcelain"],
         cwd=repo_root,
@@ -56,9 +56,12 @@ def _cleanup_dirty_workspace(repo_root: Path, console: Console) -> None:
         check=False,
     )
     if status.returncode == 0 and status.stdout.strip():
-        console.print("[yellow]Cleaning up uncommitted changes from stale run...[/yellow]")
-        subprocess.run(["git", "reset", "--hard", "HEAD"], cwd=repo_root, capture_output=True, check=False)
-        subprocess.run(["git", "clean", "-fd"], cwd=repo_root, capture_output=True, check=False)
+        console.print("[yellow]Stale run detected, but workspace is dirty.[/yellow]")
+        raise ValueError(
+            "Cannot start a new run after adopting a stale run because the working tree is dirty. "
+            "Ralph will not run git reset/clean automatically; inspect, commit, stash, or discard "
+            "the changes yourself, then run start again."
+        )
 
 
 app = typer.Typer(
@@ -448,13 +451,12 @@ def start_command(
                             f"Use `ralph watch --run-id {resumable_run.id}` to observe it."
                         )
                     if resumable_run.status == "running":
-                        # Stale controller — mark as paused so new run can start
+                        # Stale controller — only mutate run state after the
+                        # dirty-workspace guard confirms a new run can proceed.
+                        _refuse_dirty_workspace_after_stale_run(repo_root, console)
                         store.update_run_status(resumable_run.id, "paused")
                         store.release_controller(resumable_run.id, stop_reason='{"cause": "stale", "detail": "Superseded by new run"}')
                         console.print(f"[yellow]Marked stale run {resumable_run.id} as paused.[/yellow]")
-                        # Clean up any uncommitted changes left by the dead run.
-                        # These will be re-attempted when the stale run is resumed.
-                        _cleanup_dirty_workspace(repo_root, console)
                     else:
                         raise ValueError(
                             "A previous run is still resumable. "

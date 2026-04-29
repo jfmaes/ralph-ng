@@ -11,6 +11,16 @@ auto_escalate_model = "opus"
 executor = "opus"
 cli = "claude"
 
+[roles.executor]
+provider = "claude"
+model = "opus"
+cli_path = "claude"
+
+[roles.reviewer]
+provider = "codex"
+model = "gpt-5.3-codex"
+cli_path = "codex"
+
 [timeouts]
 executor_call_seconds = 600
 verification_command_seconds = 120

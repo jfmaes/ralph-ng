@@ -80,39 +80,18 @@ def _collect_cycle_errors(plan: Plan) -> list[str]:
     ]
 
 
-def _transitive_dependencies(task_id: str, task_lookup: dict[str, Task]) -> set[str]:
-    seen: set[str] = set()
-    queue = deque(task_lookup[task_id].depends_on)
-    while queue:
-        dependency = queue.popleft()
-        if dependency in seen or dependency not in task_lookup:
-            continue
-        seen.add(dependency)
-        queue.extend(task_lookup[dependency].depends_on)
-    return seen
-
-
 def _collect_file_reference_errors(plan: Plan, base_dir: str | Path) -> list[str]:
-    root = Path(base_dir)
-    task_lookup = _task_lookup(plan)
+    root = Path(base_dir).resolve()
     errors: list[str] = []
 
     for task in plan.tasks:
-        dependency_ids = _transitive_dependencies(task.id, task_lookup)
-        dependency_outputs = {
-            expected_file
-            for dependency_id in dependency_ids
-            for expected_file in task_lookup[dependency_id].expected_files
-        }
         for expected_file in task.expected_files:
-            if (root / expected_file).exists():
-                continue
-            if expected_file in dependency_outputs:
-                continue
-            errors.append(
-                f"Task {task.id} references missing file {expected_file} "
-                "that is not produced by a dependency"
-            )
+            expected_path = Path(expected_file)
+            resolved_path = (root / expected_path).resolve()
+            if expected_path.is_absolute() or not resolved_path.is_relative_to(root):
+                errors.append(
+                    f"Task {task.id} references unsafe expected file path {expected_file}"
+                )
     return errors
 
 

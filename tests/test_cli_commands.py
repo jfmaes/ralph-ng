@@ -10,8 +10,13 @@ import sys
 from typer.testing import CliRunner
 
 from ralph_ng.adapters.base import ExecutorResult, InvocationStatus
-from ralph_ng.cli import app
+from ralph_ng.cli import app, build_orchestrator
+from ralph_ng.config import RalphConfig
+from ralph_ng.events import EventLogger
+from ralph_ng.orchestrator import RunOutcome, RunStatus
+from ralph_ng.plan import load_plan
 from ralph_ng.preflight import PreflightCheck, PreflightResult
+from ralph_ng.state import StateStore
 from ralph_ng.review_findings import ReviewResult, ReviewFindings
 
 
@@ -214,6 +219,72 @@ def test_resume_loads_existing_run(tmp_path: Path, monkeypatch) -> None:
 
     assert result.exit_code == 0
     assert "completed" in result.stdout
+
+
+def test_resume_with_max_retries_reaches_orchestrator_for_failed_exhausted(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    repo = init_repo(tmp_path)
+    write_plan(repo)
+    monkeypatch.chdir(repo)
+
+    state_root = repo / ".git" / "ralph"
+    state_root.mkdir(parents=True, exist_ok=True)
+    from ralph_ng.state import StateStore
+
+    with StateStore(state_root / "state.db") as store:
+        store.create_run(
+            "ralph-plan.yaml",
+            run_id="run-001",
+            status="failed_exhausted",
+            task_ids=["TASK-001"],
+        )
+        store.transition_task("run-001", "TASK-001", "failed_exhausted", attempt_count=3)
+
+    calls: list[tuple[str, int | None]] = []
+
+    class FakeOrchestrator:
+        def resume(
+            self,
+            *,
+            run_id: str,
+            task_limit: int | None = None,
+            max_retries: int | None = None,
+        ) -> RunOutcome:
+            calls.append((run_id, max_retries))
+            return RunOutcome(run_id=run_id, status=RunStatus.COMPLETED, reason="Plan complete")
+
+    monkeypatch.setattr("ralph_ng.cli.build_orchestrator", lambda **kwargs: FakeOrchestrator())
+    monkeypatch.setattr("ralph_ng.cli.run_with_progress", lambda action, **kwargs: action())
+
+    result = runner.invoke(app, ["resume", "--run-id", "run-001", "--max-retries", "6"])
+
+    assert result.exit_code == 0
+    assert calls == [("run-001", 6)]
+    assert "completed" in result.stdout
+
+
+def test_build_orchestrator_allows_disabled_review_without_reviewer_roles(tmp_path: Path) -> None:
+    repo = init_repo(tmp_path)
+    write_plan(repo)
+    config = RalphConfig()
+    config.review.enabled = False
+    state_root = repo / ".git" / "ralph"
+    state_root.mkdir(parents=True, exist_ok=True)
+
+    with StateStore(state_root / "state.db") as store:
+        orchestrator = build_orchestrator(
+            repo_root=repo,
+            plan=load_plan(repo / "ralph-plan.yaml"),
+            plan_path=repo / "ralph-plan.yaml",
+            config=config,
+            state_root=state_root,
+            store=store,
+            events=EventLogger(state_root / "events.jsonl"),
+        )
+
+    assert orchestrator.config.review.enabled is False
 
 
 def test_start_and_resume_respect_number_of_tasks(tmp_path: Path, monkeypatch) -> None:
@@ -429,6 +500,34 @@ def test_start_refuses_dirty_tree(tmp_path: Path, monkeypatch) -> None:
 
     assert result.exit_code == 1
     assert "dirty" in result.stdout.lower()
+
+
+def test_start_does_not_clean_dirty_tree_when_adopting_stale_run(tmp_path: Path, monkeypatch) -> None:
+    repo = init_repo(tmp_path)
+    write_plan(repo)
+    monkeypatch.chdir(repo)
+    monkeypatch.setattr("ralph_ng.cli.generate_run_id", lambda: "run-new")
+    monkeypatch.setattr("ralph_ng.cli.build_executor", lambda config, **kw: FakeExecutor(repo))
+    monkeypatch.setattr("ralph_ng.cli.build_reviewer", lambda config, **kw: FakeReviewer())
+
+    from ralph_ng.state import StateStore
+
+    state_root = repo / ".git" / "ralph"
+    with StateStore(state_root / "state.db") as store:
+        store.create_run("ralph-plan.yaml", run_id="run-stale", status="running", task_ids=["TASK-001"])
+
+    (repo / "work.txt").write_text("user edit\n", encoding="utf-8")
+    (repo / "scratch.txt").write_text("untracked user file\n", encoding="utf-8")
+
+    result = runner.invoke(app, ["start"])
+
+    assert result.exit_code == 1
+    assert "stale run" in result.stdout.lower()
+    assert "dirty" in result.stdout.lower()
+    assert (repo / "work.txt").read_text(encoding="utf-8") == "user edit\n"
+    assert (repo / "scratch.txt").read_text(encoding="utf-8") == "untracked user file\n"
+    with StateStore(repo / ".git" / "ralph" / "state.db") as store:
+        assert store.get_run("run-stale").status == "running"
 
 
 def test_start_refuses_if_plan_validation_fails(tmp_path: Path, monkeypatch) -> None:

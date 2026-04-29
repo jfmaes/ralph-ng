@@ -96,6 +96,11 @@ release. `ralph start`, `resume`, `watch`, and the rest do not read from
 `skills/` at runtime; the skills are companion workflows for planning, repair,
 triage, and initialization.
 
+The bundled Ralph skills prefer an installed `ralph` on `PATH`. If you want an
+agent to use a local checkout instead, export `RALPH_NG_ROOT=/path/to/ralph-ng`
+before asking it to use a Ralph skill. The setup snippets activate that
+checkout's `.venv` only when `RALPH_NG_ROOT` is set.
+
 ## Architecture
 
 ```
@@ -253,6 +258,16 @@ auto_escalate_model = "opus"
 [models]
 executor = "opus"
 cli = "claude"
+
+[roles.executor]
+provider = "claude"
+model = "opus"
+cli_path = "claude"
+
+[roles.reviewer]
+provider = "codex"
+model = "gpt-5.3-codex"
+cli_path = "codex"
 
 [timeouts]
 executor_call_seconds = 600

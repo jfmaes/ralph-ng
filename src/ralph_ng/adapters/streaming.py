@@ -7,6 +7,7 @@ LiveActivityTracker that bridges transport threads with the TUI renderer.
 from __future__ import annotations
 
 import os
+import queue
 import signal
 import subprocess
 import threading
@@ -246,21 +247,42 @@ def stream_subprocess(
     stderr_thread = threading.Thread(target=_drain_stderr, daemon=True)
     stderr_thread.start()
 
-    # Read stdout line-by-line in calling thread
-    try:
+    # Read stdout in a background thread so cancellation can be polled even
+    # while a provider is silent and no newline is available.
+    stdout_queue: queue.Queue[str | None] = queue.Queue()
+
+    def _drain_stdout() -> None:
         assert process.stdout is not None
-        for line in process.stdout:
+        try:
+            for line in process.stdout:
+                stdout_queue.put(line)
+        finally:
+            stdout_queue.put(None)
+
+    stdout_thread = threading.Thread(target=_drain_stdout, daemon=True)
+    stdout_thread.start()
+
+    # Dispatch stdout callbacks in the calling thread.
+    stdout_done = False
+    try:
+        while not stdout_done or process.poll() is None:
+            if cancel_event is not None and cancel_event.is_set() and process.poll() is None:
+                _graceful_kill(is_cancel=True)
+            try:
+                line = stdout_queue.get(timeout=0.05)
+            except queue.Empty:
+                continue
+            if line is None:
+                stdout_done = True
+                continue
             if on_heartbeat is not None:
                 on_heartbeat()
             if on_line is not None:
                 on_line(line)
-            # Check for cancellation between lines
-            if cancel_event is not None and cancel_event.is_set():
-                _graceful_kill(is_cancel=True)
-                break
     finally:
         process.wait()
         timer.cancel()
+        stdout_thread.join(timeout=5.0)
         stderr_thread.join(timeout=5.0)
         if stdin_handle is not None:
             stdin_handle.close()

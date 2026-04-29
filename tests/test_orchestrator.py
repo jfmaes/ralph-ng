@@ -110,6 +110,17 @@ class FakeReviewer:
         return behavior(attempt_number)
 
 
+class FailingReviewer:
+    def review(
+        self,
+        prompt: str,
+        *,
+        timeout_seconds: int | float,
+        cwd: str | None = None,
+    ) -> ReviewResult:
+        raise AssertionError("reviewer should not be called when review is disabled")
+
+
 class DriftAfterFirstCommitGitManager(GitManager):
     def __init__(self, **kwargs: object) -> None:
         super().__init__(**kwargs)
@@ -456,6 +467,24 @@ def test_accepts_clean_tree_without_creating_new_commit(tmp_path: Path) -> None:
     assert accepted
 
 
+def test_review_disabled_accepts_passing_verification_without_reviewer(tmp_path: Path) -> None:
+    repo = init_repo(tmp_path)
+    plan = make_plan(1)
+    executor = FakeExecutor(repo, {"TASK-001": [executor_write_marker("TASK-001")]})
+    _, store, _, orchestrator = make_orchestrator(
+        tmp_path,
+        plan,
+        executor,
+        FailingReviewer(),  # type: ignore[arg-type]
+    )
+    orchestrator.config.review.enabled = False
+
+    outcome = orchestrator.start(run_id="run-001")
+
+    assert outcome.status is RunStatus.COMPLETED
+    assert store.get_task_state("run-001", "TASK-001").state == "done"
+
+
 def test_failed_exhausted_after_retry_budget(tmp_path: Path) -> None:
     repo = init_repo(tmp_path)
     plan = make_plan(1)
@@ -478,6 +507,31 @@ def test_failed_exhausted_after_retry_budget(tmp_path: Path) -> None:
 
     assert outcome.status is RunStatus.BLOCKED_HUMAN
     # With adversarial review, 3 consecutive high-confidence rejections → escalation
+
+
+def test_resume_with_increased_retry_budget_restores_exhausted_task_to_repair(tmp_path: Path) -> None:
+    repo = init_repo(tmp_path)
+    plan = make_plan(1)
+    executor = FakeExecutor(repo, {"TASK-001": [executor_write_marker("TASK-001")]})
+    reviewer = FakeReviewer({"TASK-001": [accept_verdict()]})
+    _, store, _, orchestrator = make_orchestrator(tmp_path, plan, executor, reviewer, max_retries=3)
+    store.create_run("ralph-plan.yaml", run_id="run-001", status="blocked_human", task_ids=["TASK-001"])
+    repair_payload = json.dumps({"repair_notes": "fix failing assertion", "rejection_count": 2})
+    store.transition_task(
+        "run-001",
+        "TASK-001",
+        "failed_exhausted",
+        attempt_count=3,
+        last_error=repair_payload,
+    )
+
+    orchestrator._reset_blocked_tasks("run-001", max_retries=6)
+
+    record = store.get_task_state("run-001", "TASK-001")
+    assert record is not None
+    assert record.state == "repair"
+    assert record.attempt_count == 3
+    assert record.last_error == repair_payload
 
 
 def test_blocked_system_on_rate_limit_pauses_cleanly(tmp_path: Path) -> None:

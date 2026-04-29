@@ -72,6 +72,7 @@ ALLOWED_TRANSITIONS: dict[TaskState, set[TaskState]] = {
     TaskState.DONE: set(),
     TaskState.FAILED_EXHAUSTED: {
         TaskState.PENDING,
+        TaskState.REPAIR,
     },
 }
 

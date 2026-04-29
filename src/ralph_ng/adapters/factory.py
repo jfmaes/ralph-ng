@@ -22,6 +22,13 @@ class FactoryError(ValueError):
     """Raised when adapter construction fails."""
 
 
+class DisabledReviewerAdapter(ReviewerAdapter):
+    """Reviewer adapter placeholder used when review is disabled."""
+
+    def review(self, prompt: str, *, timeout_seconds: int | float, cwd: str | None = None):
+        raise FactoryError("Reviewer cannot be invoked because review.enabled is false.")
+
+
 def _build_transport(
     role_config: RoleConfig,
     *,
@@ -87,6 +94,9 @@ def build_reviewer(
     Uses [roles.reviewer] if present. Raises if no role config provides
     a reviewer.
     """
+    if not config.review.enabled:
+        return DisabledReviewerAdapter()
+
     if config.roles is not None:
         transport = _build_transport(config.roles.reviewer, tracker=tracker)
         return StructuredReviewerAdapter(transport=transport, tracker=tracker)
