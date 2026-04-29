@@ -7,6 +7,30 @@ description: "Diagnose interrupted, blocked, or stale ralph-ng runs. Use when a 
 
 Diagnose a `ralph-ng` run before touching repo state.
 
+## Ralph CLI setup
+
+Before any `ralph ...` command, prefer an installed `ralph` on `PATH`. If you
+need the local checkout, set `RALPH_NG_ROOT=/path/to/ralph-ng` and activate its
+venv in the same shell. Activation does not persist across separate tool calls.
+
+```bash
+if [ -n "${RALPH_NG_ROOT:-}" ]; then
+  test -d "$RALPH_NG_ROOT"
+  if [ ! -x "$RALPH_NG_ROOT/.venv/bin/ralph" ]; then
+    python3 -m venv "$RALPH_NG_ROOT/.venv"
+    "$RALPH_NG_ROOT/.venv/bin/pip" install -e "$RALPH_NG_ROOT[dev]"
+  fi
+  source "$RALPH_NG_ROOT/.venv/bin/activate"
+elif ! command -v ralph >/dev/null 2>&1; then
+  echo "Set RALPH_NG_ROOT=/path/to/ralph-ng or install ralph-ng on PATH." >&2
+  exit 1
+fi
+ralph --help
+```
+
+If `RALPH_NG_ROOT` is set, `which ralph` should resolve to
+`$RALPH_NG_ROOT/.venv/bin/ralph`.
+
 ## When to use this skill
 
 - `ralph start` or `ralph resume` failed
@@ -21,6 +45,7 @@ Diagnose a `ralph-ng` run before touching repo state.
 Start with the supported commands:
 
 ```bash
+if [ -n "${RALPH_NG_ROOT:-}" ]; then source "$RALPH_NG_ROOT/.venv/bin/activate"; fi
 ralph status --run-id <id>
 ralph doctor --run-id <id>
 ```

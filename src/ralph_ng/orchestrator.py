@@ -301,7 +301,7 @@ class Orchestrator:
                     # Continue from current state with a higher budget.
                     # Reset to REPAIR so the executor retries with existing code.
                     self._transition(
-                        run_id, task_id, TaskState.PENDING,
+                        run_id, task_id, TaskState.REPAIR,
                         attempt_count=record.attempt_count,
                         last_error=record.last_error,
                     )
@@ -311,7 +311,7 @@ class Orchestrator:
                         data={
                             "run_id": run_id,
                             "from_state": record.state,
-                            "to_state": TaskState.PENDING,
+                            "to_state": TaskState.REPAIR,
                             "attempt_count": record.attempt_count,
                             "reason": "retry_budget_increased",
                             "max_retries": max_retries,
@@ -823,6 +823,29 @@ class Orchestrator:
         git_diff = ""
         if latest_attempt.patch_path is not None:
             git_diff = Path(latest_attempt.patch_path).read_text(encoding="utf-8")
+
+        if not self.config.review.enabled:
+            all_verification_passed = all(result.success for result in verification_results)
+            findings = ReviewFindings(
+                decision="accept",
+                confidence=1.0,
+                spec_compliance="pass" if all_verification_passed else "partial",
+                summary=(
+                    "Review disabled; verification passed."
+                    if all_verification_passed
+                    else "Review disabled; verification failed."
+                ),
+                findings=[],
+            )
+            return self._process_review_verdict(
+                run_id,
+                task,
+                attempt_number,
+                findings,
+                RiskLevel.LOW,
+                verification_results,
+                ratchet_manager,
+            )
 
         return self._adversarial_review(
             run_id, task, attempt_number, run_paths, latest_attempt,

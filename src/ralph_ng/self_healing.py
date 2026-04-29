@@ -8,6 +8,8 @@ for cross-model diagnosis.
 from __future__ import annotations
 
 import json
+import re
+import shlex
 import subprocess
 import time
 from dataclasses import dataclass
@@ -33,6 +35,28 @@ BLOCKED_COMMAND_PREFIXES = (
     "git reset --hard",
     "git clean",
     "rm -rf /",
+)
+
+SHELL_METACHARACTER_PATTERN = re.compile(r"[;&|<>`$()]")
+
+SAFE_AUTO_FIX_COMMANDS: tuple[tuple[str, ...], ...] = (
+    ("npm", "install"),
+    ("npm", "ci"),
+    ("pnpm", "install"),
+    ("yarn", "install"),
+    ("pip", "install"),
+    ("pip3", "install"),
+    ("uv", "sync"),
+    ("uv", "pip", "install"),
+    ("poetry", "install"),
+    ("python", "-m", "pip", "install"),
+    ("python3", "-m", "pip", "install"),
+)
+
+DANGEROUS_AUTO_FIX_PATTERNS = (
+    re.compile(r"\brm\s+-[^\s]*r[^\s]*f?[^\s]*\s+(?:\.git|/|\.)\b", re.IGNORECASE),
+    re.compile(r"\bgit\s+reset\s+--hard\b", re.IGNORECASE),
+    re.compile(r"\bgit\s+clean\b", re.IGNORECASE),
 )
 
 
@@ -75,11 +99,23 @@ def is_failure_eligible_for_diagnosis(failure_class: FailureClass) -> bool:
 
 def _validate_auto_fix_command(command: str) -> bool:
     """Check if an auto-fix command is safe to execute."""
-    stripped = command.strip().lower()
-    for prefix in BLOCKED_COMMAND_PREFIXES:
-        if stripped.startswith(prefix.lower()):
+    stripped = command.strip()
+    lowered = stripped.lower()
+    if not stripped or "\n" in stripped:
+        return False
+    if SHELL_METACHARACTER_PATTERN.search(stripped):
+        return False
+    for pattern in DANGEROUS_AUTO_FIX_PATTERNS:
+        if pattern.search(stripped):
             return False
-    return True
+    for prefix in BLOCKED_COMMAND_PREFIXES:
+        if lowered.startswith(prefix.lower()):
+            return False
+    try:
+        tokens = tuple(shlex.split(stripped))
+    except ValueError:
+        return False
+    return any(tokens[: len(allowed)] == allowed for allowed in SAFE_AUTO_FIX_COMMANDS)
 
 
 def _run_auto_fix_command(

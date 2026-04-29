@@ -7,6 +7,30 @@ description: "Initialize a repository for ralph-ng autonomous coding. Use when a
 
 Prepare a repository so `ralph-ng` can run against it safely.
 
+## Ralph CLI setup
+
+Before any `ralph ...` command, prefer an installed `ralph` on `PATH`. If you
+need the local checkout, set `RALPH_NG_ROOT=/path/to/ralph-ng` and activate its
+venv in the same shell. Activation does not persist across separate tool calls.
+
+```bash
+if [ -n "${RALPH_NG_ROOT:-}" ]; then
+  test -d "$RALPH_NG_ROOT"
+  if [ ! -x "$RALPH_NG_ROOT/.venv/bin/ralph" ]; then
+    python3 -m venv "$RALPH_NG_ROOT/.venv"
+    "$RALPH_NG_ROOT/.venv/bin/pip" install -e "$RALPH_NG_ROOT[dev]"
+  fi
+  source "$RALPH_NG_ROOT/.venv/bin/activate"
+elif ! command -v ralph >/dev/null 2>&1; then
+  echo "Set RALPH_NG_ROOT=/path/to/ralph-ng or install ralph-ng on PATH." >&2
+  exit 1
+fi
+ralph --help
+```
+
+If `RALPH_NG_ROOT` is set, `which ralph` should resolve to
+`$RALPH_NG_ROOT/.venv/bin/ralph`.
+
 ## When to use this skill
 
 - The user says "init ralph", "set up ralph", or "make this repo ralphable"
@@ -41,6 +65,7 @@ Check for:
 Run:
 
 ```bash
+if [ -n "${RALPH_NG_ROOT:-}" ]; then source "$RALPH_NG_ROOT/.venv/bin/activate"; fi
 ralph validate-plan --plan ralph-plan.yaml --base-dir .
 ralph preflight
 ```

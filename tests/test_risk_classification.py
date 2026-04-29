@@ -59,8 +59,30 @@ class TestPathOverrides:
     def test_security_path_forces_critical(self) -> None:
         assert classify_diff_risk(5, ["src/auth/login.py"]) == RiskLevel.CRITICAL
 
+    @pytest.mark.parametrize(
+        "path",
+        [
+            "auth/login.py",
+            ".env",
+            ".env.local",
+        ],
+    )
+    def test_root_level_security_paths_force_critical(self, path: str) -> None:
+        assert classify_diff_risk(5, [path]) == RiskLevel.CRITICAL
+
     def test_high_risk_path_bumps_one(self) -> None:
         assert classify_diff_risk(10, ["src/migration_001.py"]) == RiskLevel.MEDIUM
+
+    @pytest.mark.parametrize(
+        "path",
+        [
+            "Dockerfile",
+            "Dockerfile.dev",
+            ".github/workflows/ci.yml",
+        ],
+    )
+    def test_root_level_high_risk_paths_bump_one(self, path: str) -> None:
+        assert classify_diff_risk(10, [path]) == RiskLevel.MEDIUM
 
     def test_high_risk_path_bumps_medium_to_high(self) -> None:
         assert classify_diff_risk(50, ["src/migration_001.py"]) == RiskLevel.HIGH

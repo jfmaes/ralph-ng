@@ -85,6 +85,17 @@ class ResumeManager:
             )
 
         existing = task_states.get(next_task.id)
+        if existing is not None and TaskState(existing.state) == TaskState.FAILED_EXHAUSTED:
+            return ResumeDecision(
+                action=ResumeAction.CONTINUE,
+                task_id=next_task.id,
+                resume_state=TaskState.FAILED_EXHAUSTED,
+                reason=(
+                    f"Retry budget was exhausted for {next_task.id}; orchestration will "
+                    "apply the selected resume retry policy."
+                ),
+            )
+
         attempt_count = 0 if existing is None else existing.attempt_count
         self.store.transition_task(
             run_id,
@@ -322,9 +333,14 @@ class ResumeManager:
         for task in plan.tasks:
             record = task_states.get(task.id)
             state = TaskState.PENDING if record is None else TaskState(record.state)
-            if state in {TaskState.DONE, TaskState.FAILED_EXHAUSTED}:
+            if state == TaskState.DONE:
                 continue
-            if state in {TaskState.PENDING, TaskState.READY} and all(
+            resumable_states = {
+                TaskState.PENDING,
+                TaskState.READY,
+                TaskState.FAILED_EXHAUSTED,
+            }
+            if state in resumable_states and all(
                 dependency in completed for dependency in task.depends_on
             ):
                 return task

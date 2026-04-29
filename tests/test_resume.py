@@ -256,7 +256,22 @@ def test_resume_recovers_when_branch_rewound_to_accepted_commit(tmp_path: Path) 
     assert store.get_task_state("run-001", "TASK-004").state == "pending"
 
 
-def test_resume_after_failed_exhausted_skips_task_and_continues(tmp_path: Path) -> None:
+def test_resume_complete_when_all_tasks_done(tmp_path: Path) -> None:
+    plan = make_plan()
+    _, store, _, _, resume = make_managers(tmp_path)
+    store.create_run("ralph-plan.yaml", run_id="run-001", task_ids=[task.id for task in plan.tasks])
+    store.transition_task("run-001", "TASK-001", "done", attempt_count=1)
+    store.transition_task("run-001", "TASK-002", "done", attempt_count=1)
+
+    decision = resume.resume("run-001", plan)
+
+    assert decision.action is ResumeAction.COMPLETE
+    assert decision.task_id is None
+    assert store.get_task_state("run-001", "TASK-001").state == "done"
+    assert store.get_task_state("run-001", "TASK-002").state == "done"
+
+
+def test_resume_after_failed_exhausted_continues_exhausted_task(tmp_path: Path) -> None:
     plan = make_plan()
     _, store, _, _, resume = make_managers(tmp_path)
     store.create_run("ralph-plan.yaml", run_id="run-001", task_ids=[task.id for task in plan.tasks])
@@ -265,5 +280,8 @@ def test_resume_after_failed_exhausted_skips_task_and_continues(tmp_path: Path) 
     decision = resume.resume("run-001", plan)
 
     assert decision.action is ResumeAction.CONTINUE
-    assert decision.task_id == "TASK-002"
-    assert decision.resume_state == "ready"
+    assert decision.task_id == "TASK-001"
+    assert decision.resume_state == "failed_exhausted"
+    record = store.get_task_state("run-001", "TASK-001")
+    assert record.state == "failed_exhausted"
+    assert record.attempt_count == 3

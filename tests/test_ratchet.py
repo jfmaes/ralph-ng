@@ -33,6 +33,24 @@ def test_check_with_missing_binary_is_rejected(tmp_path: Path) -> None:
     assert "missing binary" in result.rejected[0].reason
 
 
+def test_validation_does_not_execute_command_side_effects(tmp_path: Path) -> None:
+    manager = RatchetManager(
+        overlay_dir=tmp_path / "overlays",
+        cwd=tmp_path,
+        max_checks_per_task=10,
+        validation_timeout_seconds=1,
+    )
+    marker = tmp_path / "ratchet-validation-side-effect"
+
+    result = manager.add_checks(
+        "TASK-001",
+        ["python3 -c \"from pathlib import Path; Path('ratchet-validation-side-effect').write_text('x')\""],
+    )
+
+    assert result.accepted
+    assert not marker.exists()
+
+
 def test_check_with_bad_syntax_is_rejected(tmp_path: Path) -> None:
     manager = RatchetManager(
         overlay_dir=tmp_path / "overlays",
@@ -59,6 +77,26 @@ def test_dangerous_pipe_to_shell_pattern_is_rejected(tmp_path: Path) -> None:
 
     assert result.accepted == []
     assert "dangerous shell pattern" in result.rejected[0].reason
+
+
+def test_shell_control_operator_chains_are_rejected(tmp_path: Path) -> None:
+    manager = RatchetManager(
+        overlay_dir=tmp_path / "overlays",
+        cwd=tmp_path,
+        max_checks_per_task=10,
+        validation_timeout_seconds=1,
+    )
+
+    for command in [
+        "python3 -c \"print(1)\" || rm -rf .git",
+        "python3 -c \"print(1)\"; git reset --hard",
+        "pytest -q && git clean -fdx",
+    ]:
+        result = manager.add_checks("TASK-001", [command])
+
+        assert result.accepted == []
+        assert result.rejected[0].command == command
+        assert "shell control" in result.rejected[0].reason
 
 
 def test_environment_probe_command_is_rejected(tmp_path: Path) -> None:

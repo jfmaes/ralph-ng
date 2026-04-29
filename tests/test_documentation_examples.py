@@ -2,6 +2,7 @@ from pathlib import Path
 
 import yaml
 
+from ralph_ng.adapters.factory import build_executor, build_reviewer
 from ralph_ng.config import load_config
 from ralph_ng.ratchet import RatchetOverlay
 from ralph_ng.validation import validate_plan_file
@@ -14,6 +15,15 @@ def test_example_config_loads() -> None:
 
     assert config.models.executor == "opus"
     assert config.git.protected_branches == ["main", "master"]
+
+
+def test_example_config_builds_required_adapters() -> None:
+    root = Path(__file__).resolve().parents[1] / "docs" / "examples"
+
+    config = load_config(root / "ralph.toml.example")
+
+    build_executor(config)
+    build_reviewer(config)
 
 
 def test_example_plan_validates() -> None:

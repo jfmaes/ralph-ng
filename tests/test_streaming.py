@@ -220,6 +220,30 @@ class TestStreamSubprocess:
         assert result.returncode != 0
         assert elapsed < 5.0
 
+    def test_cancel_event_interrupts_silent_process_before_timeout(self) -> None:
+        cancel_event = threading.Event()
+
+        def cancel_after_delay() -> None:
+            time.sleep(0.2)
+            cancel_event.set()
+
+        thread = threading.Thread(target=cancel_after_delay)
+        thread.start()
+        started = time.monotonic()
+        result = stream_subprocess(
+            [sys.executable, "-c", "import time; time.sleep(30)"],
+            timeout_seconds=2.0,
+            cancel_event=cancel_event,
+            grace_seconds=0.1,
+        )
+        elapsed = time.monotonic() - started
+        thread.join(timeout=1.0)
+
+        assert result.cancelled is True
+        assert result.timed_out is False
+        assert result.returncode != 0
+        assert elapsed < 1.5
+
     def test_nonzero_exit_code(self) -> None:
         result = stream_subprocess(
             [sys.executable, "-c", "import sys; sys.exit(42)"],

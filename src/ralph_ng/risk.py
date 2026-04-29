@@ -42,30 +42,50 @@ _ORD_TO_LEVEL = {v: k for k, v in _LEVEL_TO_ORD.items()}
 # Built-in defaults — config extends these, `!pattern` removes.
 DEFAULT_SECURITY_PATHS: frozenset[str] = frozenset(
     {
+        "auth/*",
         "*/auth/*",
+        "crypto/*",
         "*/crypto/*",
+        "security/*",
         "*/security/*",
+        "secrets/*",
         "*/secrets/*",
+        ".env*",
         "*/.env*",
+        "credentials*",
         "*/credentials*",
+        "token*",
         "*/token*",
+        "permission*",
         "*/permission*",
+        "acl/*",
         "*/acl/*",
     }
 )
 
 DEFAULT_HIGH_RISK_PATHS: frozenset[str] = frozenset(
     {
+        "migration*",
         "*/migration*",
+        "schema*",
         "*/schema*",
+        "database/*",
         "*/database/*",
+        "db/*",
         "*/db/*",
+        "deploy/*",
         "*/deploy/*",
+        "ci/*",
         "*/ci/*",
+        ".github/*",
         "*/.github/*",
+        "Dockerfile*",
         "*/Dockerfile*",
+        "docker-compose*",
         "*/docker-compose*",
+        "infra/*",
         "*/infra/*",
+        "terraform/*",
         "*/terraform/*",
     }
 )

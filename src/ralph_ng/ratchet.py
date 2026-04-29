@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import ast
+import os
 from pathlib import Path
 import re
 import shlex
@@ -12,10 +14,16 @@ from pydantic import BaseModel, ConfigDict, Field
 import yaml
 
 
+PIPE_TO_SHELL_PATTERN = re.compile(r"\b(?:curl|wget)\b.*\|\s*(?:bash|sh|zsh)\b", re.IGNORECASE)
+
 DANGEROUS_COMMAND_PATTERNS = [
-    re.compile(r"\b(?:curl|wget)\b.*\|\s*(?:bash|sh|zsh)\b", re.IGNORECASE),
     re.compile(r"\brm\s+-rf\s+/", re.IGNORECASE),
+    re.compile(r"\brm\s+-[^\s]*r[^\s]*f?[^\s]*\s+(?:\.git|\.|/)\b", re.IGNORECASE),
+    re.compile(r"\bgit\s+reset\s+--hard\b", re.IGNORECASE),
+    re.compile(r"\bgit\s+clean\b", re.IGNORECASE),
 ]
+
+SHELL_CONTROL_OPERATORS = {";", ";;", "&", "&&", "|", "||", ">", ">>", "<", "<<"}
 
 ENVIRONMENT_PROBE_PATTERNS = [
     re.compile(r"^\s*command\s+-v\s+\S+\s*$", re.IGNORECASE),
@@ -135,9 +143,34 @@ class RatchetManager:
         if preflight_reason is not None:
             return preflight_reason
 
+        syntax_reason = self._shell_syntax_reject_reason(command)
+        if syntax_reason is not None:
+            return syntax_reason
+
+        try:
+            tokens = shlex.split(command)
+        except ValueError:
+            return "syntax error detected during ratchet validation"
+        if not tokens:
+            return "empty verification command"
+
+        executable = tokens[0]
+        if shutil.which(executable) is None:
+            alt = PORTABLE_ALTERNATIVES.get(executable)
+            if alt:
+                return f"missing binary '{executable}' — portable alternative: {alt}"
+            return "missing binary or command not found"
+
+        python_reason = self._python_inline_syntax_reject_reason(tokens)
+        if python_reason is not None:
+            return python_reason
+
+        return None
+
+    def _shell_syntax_reject_reason(self, command: str) -> str | None:
         try:
             completed = subprocess.run(
-                [self.shell, "-lc", command],
+                [self.shell, "-n", "-c", command],
                 cwd=self.cwd,
                 capture_output=True,
                 text=True,
@@ -147,31 +180,55 @@ class RatchetManager:
         except subprocess.TimeoutExpired:
             return "validation timed out before command executability could be confirmed"
 
-        stderr = completed.stderr.lower()
-        stdout = completed.stdout.lower()
-        if self._looks_like_missing_binary(command, completed.returncode, completed.stderr):
-            # Suggest a portable alternative if available
-            try:
-                executable = shlex.split(command)[0]
-            except (ValueError, IndexError):
-                executable = ""
-            alt = PORTABLE_ALTERNATIVES.get(executable)
-            if alt and not shutil.which(executable):
-                return f"missing binary '{executable}' — portable alternative: {alt}"
-            return "missing binary or command not found"
-        if "syntax error" in stderr or "syntaxerror" in stderr or "syntax error" in stdout:
+        output = f"{completed.stderr}\n{completed.stdout}".lower()
+        if completed.returncode != 0 or "syntax error" in output or "syntaxerror" in output:
+            return "syntax error detected during ratchet validation"
+        return None
+
+    def _python_inline_syntax_reject_reason(self, tokens: list[str]) -> str | None:
+        executable = os.path.basename(tokens[0]).lower()
+        if not executable.startswith("python"):
+            return None
+        try:
+            code_index = tokens.index("-c") + 1
+            code = tokens[code_index]
+        except (ValueError, IndexError):
+            return None
+        try:
+            ast.parse(code)
+        except SyntaxError:
             return "syntax error detected during ratchet validation"
         return None
 
     def _preflight_reject_reason(self, command: str) -> str | None:
         if "\n" in command:
             return "multi-line ratchet commands are not allowed"
+        if PIPE_TO_SHELL_PATTERN.search(command):
+            return "command uses a blocked dangerous shell pattern"
+        control_reason = self._shell_control_reject_reason(command)
+        if control_reason is not None:
+            return control_reason
         for pattern in DANGEROUS_COMMAND_PATTERNS:
             if pattern.search(command):
                 return "command uses a blocked dangerous shell pattern"
         for pattern in ENVIRONMENT_PROBE_PATTERNS:
             if pattern.match(command):
                 return "environment probe commands are not allowed as persistent verification checks"
+        return None
+
+    def _shell_control_reject_reason(self, command: str) -> str | None:
+        if "$(" in command or "`" in command:
+            return "shell control operators are not allowed in ratchet commands"
+        try:
+            lexer = shlex.shlex(command, posix=True, punctuation_chars=True)
+            lexer.whitespace_split = True
+            lexer.commenters = ""
+            tokens = list(lexer)
+        except ValueError:
+            return "syntax error detected during ratchet validation"
+        for token in tokens:
+            if token in SHELL_CONTROL_OPERATORS:
+                return "shell control operators are not allowed in ratchet commands"
         return None
 
     def _looks_like_missing_binary(self, command: str, returncode: int, stderr: str) -> bool:

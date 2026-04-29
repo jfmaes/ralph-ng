@@ -8,6 +8,31 @@ description: "Convert markdown spec and implementation plan documents into a val
 Convert human-readable markdown specs and implementation plans into a
 `ralph-plan.yaml` that `ralph-ng` can execute.
 
+## Ralph CLI setup
+
+Before running the bundled converter or any `ralph ...` command, prefer an
+installed `ralph` on `PATH`. If you need the local checkout, set
+`RALPH_NG_ROOT=/path/to/ralph-ng` and activate its venv in the same shell.
+Activation does not persist across separate tool calls.
+
+```bash
+if [ -n "${RALPH_NG_ROOT:-}" ]; then
+  test -d "$RALPH_NG_ROOT"
+  if [ ! -x "$RALPH_NG_ROOT/.venv/bin/ralph" ]; then
+    python3 -m venv "$RALPH_NG_ROOT/.venv"
+    "$RALPH_NG_ROOT/.venv/bin/pip" install -e "$RALPH_NG_ROOT[dev]"
+  fi
+  source "$RALPH_NG_ROOT/.venv/bin/activate"
+elif ! command -v ralph >/dev/null 2>&1; then
+  echo "Set RALPH_NG_ROOT=/path/to/ralph-ng or install ralph-ng on PATH." >&2
+  exit 1
+fi
+ralph --help
+```
+
+If `RALPH_NG_ROOT` is set, `which ralph` should resolve to
+`$RALPH_NG_ROOT/.venv/bin/ralph`.
+
 ## When to use this skill
 
 - The repo has `spec.md`, `implementation_plan.md`, or similar planning docs
@@ -32,7 +57,8 @@ Read the markdown spec and implementation plan first. Identify:
 Preferred path when the markdown uses `### Task N: Title` headings:
 
 ```bash
-python3 skills/ralph-plan-converter/scripts/markdown_to_ralph_plan.py \
+if [ -n "${RALPH_NG_ROOT:-}" ]; then source "$RALPH_NG_ROOT/.venv/bin/activate"; fi
+python "${RALPH_NG_ROOT:-.}/skills/ralph-plan-converter/scripts/markdown_to_ralph_plan.py" \
   implementation_plan.md \
   --output ralph-plan.yaml \
   --repo-root .
@@ -41,7 +67,8 @@ python3 skills/ralph-plan-converter/scripts/markdown_to_ralph_plan.py \
 If the repo also has a root spec file, copy it into `specs/` at the same time:
 
 ```bash
-python3 skills/ralph-plan-converter/scripts/markdown_to_ralph_plan.py \
+if [ -n "${RALPH_NG_ROOT:-}" ]; then source "$RALPH_NG_ROOT/.venv/bin/activate"; fi
+python "${RALPH_NG_ROOT:-.}/skills/ralph-plan-converter/scripts/markdown_to_ralph_plan.py" \
   implementation_plan.md \
   --output ralph-plan.yaml \
   --repo-root . \
@@ -73,6 +100,7 @@ placeholder paths.
 ### Step 5: Validate
 
 ```bash
+if [ -n "${RALPH_NG_ROOT:-}" ]; then source "$RALPH_NG_ROOT/.venv/bin/activate"; fi
 ralph validate-plan --plan ralph-plan.yaml --base-dir .
 ```
 

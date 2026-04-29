@@ -59,6 +59,17 @@ def test_validate_auto_fix_blocked_rm():
     assert _validate_auto_fix_command("rm -rf /") is False
 
 
+def test_validate_auto_fix_blocked_project_git_removal():
+    """Project-destructive removal should be blocked."""
+    assert _validate_auto_fix_command("rm -rf .git") is False
+
+
+def test_validate_auto_fix_blocks_shell_indirected_dangerous_command():
+    """Shell metacharacters must not bypass destructive command checks."""
+    assert _validate_auto_fix_command("npm install && rm -rf .git") is False
+    assert _validate_auto_fix_command("sh -c 'rm -rf .git'") is False
+
+
 def test_validate_auto_fix_blocked_git_reset():
     """'git reset --hard' should be blocked."""
     assert _validate_auto_fix_command("git reset --hard") is False

@@ -80,8 +80,35 @@ class CliClaudeTransport(Transport):
         cwd: str | None = None,
         json_schema: dict[str, Any] | None = None,
     ) -> TransportResult:
-        command = self._build_command(prompt, json_schema)
+        # Linux caps a single argv entry at MAX_ARG_STRLEN (128 KiB by
+        # default), so passing the prompt via `-p <prompt>` blows up with
+        # E2BIG once the prompt includes a long plan body + diff + review
+        # context. `claude -p` without a positional prompt reads from stdin,
+        # so for large prompts we write to a tempfile and hand it to the
+        # subprocess via stdin_path. Small prompts keep the legacy argv
+        # path so existing tests (which mock stream_subprocess without
+        # stdin_path support) continue to work.
+        _STDIN_PROMPT_THRESHOLD = 100 * 1024  # 100 KiB, well under 128 KiB
+        use_stdin_prompt = len(prompt.encode("utf-8")) > _STDIN_PROMPT_THRESHOLD
+        command = self._build_command(
+            None if use_stdin_prompt else prompt, json_schema
+        )
         workdir = str(Path(cwd)) if cwd is not None else None
+        prompt_path: str | None = None
+        if use_stdin_prompt:
+            import tempfile as _tempfile, os as _os
+            prompt_fd, prompt_path = _tempfile.mkstemp(
+                prefix="ralph-claude-prompt-", suffix=".txt"
+            )
+            try:
+                with _os.fdopen(prompt_fd, "w", encoding="utf-8") as _pf:
+                    _pf.write(prompt)
+            except Exception:
+                try:
+                    _os.unlink(prompt_path)
+                except OSError:
+                    pass
+                raise
 
         # Reset accumulation state
         self._pending_tool_name = ""
@@ -155,13 +182,23 @@ class CliClaudeTransport(Transport):
                     self._report_tracker_error(exc, f"persist {event.get('type', '')}")
 
         started_at = time.monotonic()
-        stream_result = stream_subprocess(
-            command,
-            cwd=workdir,
-            timeout_seconds=timeout_seconds,
-            on_line=_on_line,
-            cancel_event=self.cancel_event,
-        )
+        try:
+            stream_kwargs: dict[str, Any] = dict(
+                cwd=workdir,
+                timeout_seconds=timeout_seconds,
+                on_line=_on_line,
+                cancel_event=self.cancel_event,
+            )
+            if prompt_path is not None:
+                stream_kwargs["stdin_path"] = prompt_path
+            stream_result = stream_subprocess(command, **stream_kwargs)
+        finally:
+            if prompt_path is not None:
+                try:
+                    import os as _os2
+                    _os2.unlink(prompt_path)
+                except OSError:
+                    pass
         duration = time.monotonic() - started_at
 
         # Persist session_id for potential --resume on next call
@@ -534,14 +571,22 @@ class CliClaudeTransport(Transport):
 
     def _build_command(
         self,
-        prompt: str,
+        prompt: str | None,
         json_schema: dict[str, Any] | None,
     ) -> list[str]:
+        """Build the claude argv.
+
+        When ``prompt`` is None, the caller is responsible for supplying the
+        prompt via stdin. When a prompt string is passed, it is included as
+        the `-p` positional argument (legacy path, subject to the 128 KiB
+        argv limit).
+        """
         cmd = [self.cli_path]
         if self.session_id is not None:
-            cmd.extend(["--resume", self.session_id, "-p", prompt])
-        else:
-            cmd.extend(["-p", prompt])
+            cmd.extend(["--resume", self.session_id])
+        cmd.append("-p")
+        if prompt is not None:
+            cmd.append(prompt)
         cmd.extend([
             "--model", self.model,
             "--output-format", "stream-json",
