@@ -83,3 +83,54 @@ branch_strategy = "detached"
         load_config(config_path)
 
     assert "branch_strategy" in str(exc_info.value)
+
+
+def test_disable_plugins_and_slash_commands_defaults_false(tmp_path: Path) -> None:
+    config_path = tmp_path / "ralph.toml"
+    config_path.write_text(
+        """
+[roles.executor]
+provider = "claude"
+model = "opus"
+cli_path = "claude"
+
+[roles.reviewer]
+provider = "codex"
+model = "gpt-5.3-codex"
+cli_path = "codex"
+""",
+        encoding="utf-8",
+    )
+    config = load_config(config_path)
+    assert config.roles is not None
+    assert config.roles.executor.disable_plugins_and_slash_commands is False
+    assert config.roles.reviewer.disable_plugins_and_slash_commands is False
+    assert config.self_healing.disable_plugins_and_slash_commands is False
+
+
+def test_disable_plugins_and_slash_commands_propagates(tmp_path: Path) -> None:
+    config_path = tmp_path / "ralph.toml"
+    config_path.write_text(
+        """
+[roles.executor]
+provider = "claude"
+model = "opus"
+cli_path = "claude"
+disable_plugins_and_slash_commands = true
+
+[roles.reviewer]
+provider = "codex"
+model = "gpt-5.3-codex"
+cli_path = "codex"
+disable_plugins_and_slash_commands = true
+
+[self_healing]
+disable_plugins_and_slash_commands = true
+""",
+        encoding="utf-8",
+    )
+    config = load_config(config_path)
+    assert config.roles is not None
+    assert config.roles.executor.disable_plugins_and_slash_commands is True
+    assert config.roles.reviewer.disable_plugins_and_slash_commands is True
+    assert config.self_healing.disable_plugins_and_slash_commands is True

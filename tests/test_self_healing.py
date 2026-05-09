@@ -182,3 +182,101 @@ def test_diagnosis_result_structure():
     assert diagnosis.human_actions == []
     assert diagnosis.notes_for_resume == "Retry after fix"
     assert diagnosis.raw_output == ""
+
+
+def test_diagnosis_appends_disable_slash_for_claude(monkeypatch, tmp_path):
+    from ralph_ng import self_healing
+    from ralph_ng.config import SelfHealingConfig
+
+    captured: dict = {}
+
+    def fake_run(cmd, **kwargs):
+        captured["cmd"] = cmd
+        class _Result:
+            returncode = 0
+            stdout = '{"ok": true}'
+            stderr = ""
+        return _Result()
+
+    monkeypatch.setattr(self_healing.subprocess, "run", fake_run)
+
+    cfg = SelfHealingConfig(
+        diagnosis_provider="claude",
+        diagnosis_cli_path="claude",
+        disable_plugins_and_slash_commands=True,
+    )
+    self_healing.run_diagnosis_session(
+        config=cfg,
+        task_id="TASK-001",
+        task_title="t",
+        task_description="d",
+        failure_class="provider_crash",
+        error_message="boom",
+        cwd=tmp_path,
+    )
+    assert "--disable-slash-commands" in captured["cmd"]
+
+
+def test_diagnosis_inserts_disable_plugins_for_codex(monkeypatch, tmp_path):
+    from ralph_ng import self_healing
+    from ralph_ng.config import SelfHealingConfig
+
+    captured: dict = {}
+
+    def fake_run(cmd, **kwargs):
+        captured["cmd"] = cmd
+        class _Result:
+            returncode = 0
+            stdout = '{"ok": true}'
+            stderr = ""
+        return _Result()
+
+    monkeypatch.setattr(self_healing.subprocess, "run", fake_run)
+
+    cfg = SelfHealingConfig(
+        diagnosis_provider="codex",
+        diagnosis_cli_path="codex",
+        disable_plugins_and_slash_commands=True,
+    )
+    self_healing.run_diagnosis_session(
+        config=cfg,
+        task_id="TASK-001",
+        task_title="t",
+        task_description="d",
+        failure_class="provider_crash",
+        error_message="boom",
+        cwd=tmp_path,
+    )
+    cmd = captured["cmd"]
+    assert "--disable" in cmd
+    assert cmd[cmd.index("--disable") + 1] == "plugins"
+    assert cmd.index("--disable") < cmd.index("exec")
+
+
+def test_diagnosis_omits_disable_when_flag_off(monkeypatch, tmp_path):
+    from ralph_ng import self_healing
+    from ralph_ng.config import SelfHealingConfig
+
+    captured: dict = {}
+
+    def fake_run(cmd, **kwargs):
+        captured["cmd"] = cmd
+        class _Result:
+            returncode = 0
+            stdout = '{"ok": true}'
+            stderr = ""
+        return _Result()
+
+    monkeypatch.setattr(self_healing.subprocess, "run", fake_run)
+
+    cfg = SelfHealingConfig(diagnosis_provider="claude", diagnosis_cli_path="claude")
+    self_healing.run_diagnosis_session(
+        config=cfg,
+        task_id="TASK-001",
+        task_title="t",
+        task_description="d",
+        failure_class="provider_crash",
+        error_message="boom",
+        cwd=tmp_path,
+    )
+    assert "--disable-slash-commands" not in captured["cmd"]

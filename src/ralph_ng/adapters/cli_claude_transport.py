@@ -55,11 +55,13 @@ class CliClaudeTransport(Transport):
         cli_path: str = "claude",
         on_event: ProviderEventCallback | None = None,
         tracker: LiveActivityTracker | None = None,
+        disable_plugins_and_slash_commands: bool = False,
     ) -> None:
         self.model = model
         self.cli_path = cli_path
         self._on_event = on_event
         self.tracker = tracker
+        self.disable_plugins_and_slash_commands = disable_plugins_and_slash_commands
         # State for accumulating tool-use input across content_block_delta events
         self._pending_tool_name: str = ""
         self._pending_tool_input_chunks: list[str] = []
@@ -593,6 +595,8 @@ class CliClaudeTransport(Transport):
             "--verbose",
             "--dangerously-skip-permissions",
         ])
+        if self.disable_plugins_and_slash_commands:
+            cmd.append("--disable-slash-commands")
         if json_schema is not None:
             cmd.extend(["--json-schema", json.dumps(json_schema, ensure_ascii=False, separators=(",", ":"))])
         return cmd

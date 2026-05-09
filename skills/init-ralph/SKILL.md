@@ -59,6 +59,61 @@ Check for:
   `specs/`.
 - If `ralph.toml` is missing, create a minimal config that matches the
   available providers and CLI binaries.
+- Default the new role/self-healing config to `disable_plugins_and_slash_commands = true`
+  so the autonomous loop sees a vanilla provider (no superpowers, no
+  frontend-design, no `/skill-name` surfaces leaking from the user's personal
+  CLI session into ralph's executor/reviewer/diagnosis subprocesses). Only flip
+  it back to `false` if the plan genuinely depends on a plugin-provided tool —
+  and document why if you do.
+
+#### Recommended `ralph.toml` skeleton
+
+```toml
+[ralph]
+branch_prefix = "ralph/"
+auto_push = false
+
+[git]
+branch_strategy = "current"
+required_branch = "main"
+
+[roles.executor]
+provider = "codex"
+model = "gpt-5.5"
+cli_path = "codex"
+reasoning_effort = "high"
+# Disable codex plugins (~/.codex/config.toml) for the loop. Skills under
+# ~/.codex/skills are environmental — wrap the CLI with a HOME-sandbox
+# script if your repo needs that level of isolation.
+disable_plugins_and_slash_commands = true
+
+[roles.reviewer]
+provider = "claude"
+model = "opus"
+cli_path = "claude"
+# Disable Claude Code skills (superpowers, frontend-design, /skill-name).
+# Plugin tool surfaces (mcp__superpowers__*) follow `claude plugins enable/
+# disable` and are governed independently.
+disable_plugins_and_slash_commands = true
+
+[review]
+enabled = true
+
+[self_healing]
+enabled = true
+diagnosis_provider = "claude"
+diagnosis_model = "opus"
+diagnosis_cli_path = "claude"
+# Mirror the executor/reviewer setting so diagnosis runs vanilla too.
+disable_plugins_and_slash_commands = true
+```
+
+The `disable_plugins_and_slash_commands` flag maps to:
+- **claude** → appends `--disable-slash-commands` to argv (turns off all
+  `/skill-name` surfaces; OAuth login is preserved).
+- **codex** → inserts `--disable plugins` before `exec` (sets
+  `features.plugins=false`, disables every plugin in `~/.codex/config.toml`).
+- **self_healing** → applies the same flag to the diagnosis subprocess.
 
 ### Step 3: Validate before running
 

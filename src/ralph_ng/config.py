@@ -105,6 +105,12 @@ class RoleConfig(BaseModel):
     cli_path: str = "claude"
     reasoning_effort: str | None = None
     service_tier: str | None = None
+    # When true, the CLI is launched with plugin / slash-command surfaces
+    # disabled so the role sees a vanilla provider. For claude this maps to
+    # ``--disable-slash-commands``; for codex it maps to ``--disable plugins``
+    # (codex skills loaded from ``~/.codex/skills`` are environmental and
+    # remain the operator's responsibility — sandbox HOME if you need that).
+    disable_plugins_and_slash_commands: bool = False
     # Reserved for v0.3 API transport
     base_url: str | None = None
     api_key_env: str | None = None
@@ -210,6 +216,10 @@ class SelfHealingConfig(BaseModel):
     diagnosis_provider: str = "claude"
     diagnosis_model: str = "opus"
     diagnosis_cli_path: str = "claude"
+    # Mirrors RoleConfig.disable_plugins_and_slash_commands for the
+    # diagnosis CLI. When true the diagnosis subprocess is launched with
+    # the same plugin/slash-command suppression as the executor/reviewer.
+    disable_plugins_and_slash_commands: bool = False
     max_diagnosis_per_task: int = Field(default=1, ge=0)
     max_auto_fix_actions_per_task: int = Field(default=2, ge=0)
     diagnosis_timeout_seconds: int = Field(default=120, ge=1)

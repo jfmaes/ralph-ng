@@ -172,6 +172,25 @@ class TestCliCodexTransport:
         ]
         Path(prompt_path).unlink()
 
+    def test_disable_plugins_default_off(self) -> None:
+        transport = CliCodexTransport(model="gpt-5.3-codex")
+        cmd, _, prompt_path = transport._build_command("review", None)
+        assert "--disable" not in cmd
+        Path(prompt_path).unlink()
+
+    def test_disable_plugins_inserts_flag(self) -> None:
+        transport = CliCodexTransport(
+            model="gpt-5.3-codex",
+            disable_plugins_and_slash_commands=True,
+        )
+        cmd, _, prompt_path = transport._build_command("review", None)
+        assert "--disable" in cmd
+        idx = cmd.index("--disable")
+        assert cmd[idx + 1] == "plugins"
+        # The flag must come before "exec" so codex applies it correctly.
+        assert idx < cmd.index("exec")
+        Path(prompt_path).unlink()
+
     def test_command_with_json_schema(self) -> None:
         transport = CliCodexTransport(model="gpt-5.3-codex")
         schema = {"type": "object", "properties": {"decision": {"type": "string"}}}

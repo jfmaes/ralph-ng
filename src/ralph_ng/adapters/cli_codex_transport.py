@@ -34,6 +34,7 @@ class CliCodexTransport(Transport):
         service_tier: str | None = None,
         on_event: ProviderEventCallback | None = None,
         tracker: LiveActivityTracker | None = None,
+        disable_plugins_and_slash_commands: bool = False,
     ) -> None:
         self.model = model
         self.cli_path = cli_path
@@ -41,6 +42,7 @@ class CliCodexTransport(Transport):
         self.service_tier = service_tier
         self._on_event = on_event
         self.tracker = tracker
+        self.disable_plugins_and_slash_commands = disable_plugins_and_slash_commands
         # Cancel event for graceful mid-stream interruption
         self.cancel_event: __import__("threading").Event | None = None
         # Buffer for accumulating streaming text deltas into full thoughts
@@ -542,4 +544,12 @@ class CliCodexTransport(Transport):
             cmd[1:1] = ["-c", f"model_reasoning_effort={json.dumps(self.reasoning_effort)}"]
         if self.service_tier is not None:
             cmd[1:1] = ["-c", f"service_tier={json.dumps(self.service_tier)}"]
+        if self.disable_plugins_and_slash_commands:
+            # ``codex --disable plugins`` is equivalent to setting
+            # features.plugins=false; it disables every plugin loaded from
+            # ~/.codex/config.toml. Skills installed under ~/.codex/skills
+            # are environmental and not gated by a feature flag — operators
+            # who need full skill isolation should sandbox HOME for the
+            # subprocess (see lectureforge's scripts/ralph-codex-bare.sh).
+            cmd[1:1] = ["--disable", "plugins"]
         return cmd, schema_path, prompt_path

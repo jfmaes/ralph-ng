@@ -181,6 +181,8 @@ def run_diagnosis_session(
             "--model", config.diagnosis_model,
             "--output-format", "text",
         ]
+        if config.disable_plugins_and_slash_commands:
+            command.append("--disable-slash-commands")
     elif config.diagnosis_provider == "codex":
         command = [
             config.diagnosis_cli_path,
@@ -188,6 +190,8 @@ def run_diagnosis_session(
             prompt,
             "--model", config.diagnosis_model,
         ]
+        if config.disable_plugins_and_slash_commands:
+            command[1:1] = ["--disable", "plugins"]
     else:
         return None
 

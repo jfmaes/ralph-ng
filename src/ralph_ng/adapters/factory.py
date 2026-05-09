@@ -46,6 +46,7 @@ def _build_transport(
             model=role_config.model,
             cli_path=role_config.cli_path,
             tracker=tracker,
+            disable_plugins_and_slash_commands=role_config.disable_plugins_and_slash_commands,
         )
     elif role_config.provider == "codex":
         return CliCodexTransport(
@@ -54,6 +55,7 @@ def _build_transport(
             reasoning_effort=role_config.reasoning_effort,
             service_tier=role_config.service_tier,
             tracker=tracker,
+            disable_plugins_and_slash_commands=role_config.disable_plugins_and_slash_commands,
         )
     else:
         raise FactoryError(

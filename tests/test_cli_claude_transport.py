@@ -405,3 +405,16 @@ class TestCliClaudeTransport:
         transport.session_id = "sess-abc123"
         transport.clear_session()
         assert transport.session_id is None
+
+    def test_disable_plugins_and_slash_commands_default_off(self) -> None:
+        transport = CliClaudeTransport(model="opus", cli_path="claude")
+        cmd = transport._build_command("hi", None)
+        assert "--disable-slash-commands" not in cmd
+
+    def test_disable_plugins_and_slash_commands_appends_flag(self) -> None:
+        transport = CliClaudeTransport(
+            model="opus", cli_path="claude",
+            disable_plugins_and_slash_commands=True,
+        )
+        cmd = transport._build_command("hi", None)
+        assert "--disable-slash-commands" in cmd
